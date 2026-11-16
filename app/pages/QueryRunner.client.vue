@@ -81,7 +81,20 @@
                 <Tag v-else :severity="getStatusSeverity(node.data.summary.status)" :value="node.data.summary.status" />
               </template>
             </Column>
-            <Column>
+            <Column :pt="{ columnHeaderContent: { class: 'justify-end' } }">
+              <template #header>
+                <Button
+                  severity="danger"
+                  outlined
+                  size="small"
+                  icon="fa-solid fa-trash"
+                  label="Clear all jobs"
+                  :loading="clearing"
+                  :disabled="!jobs.length"
+                  @click="confirmClearAll"
+                  data-testid="job-table-clear"
+                />
+              </template>
               <template #body="{ node }: { node: QueueNode }">
                 <ActionButtons
                   v-if="node.data.kind === 'job'"
@@ -547,6 +560,39 @@ async function deleteJob(jobId: string) {
     method: "delete"
   });
   await refresh();
+}
+
+const clearing = ref(false);
+
+function confirmClearAll() {
+  confirm.require({
+    message: "Delete all your jobs and their results? Running jobs are kept. This cannot be undone.",
+    header: "Clear all jobs",
+    icon: "fa-solid fa-triangle-exclamation",
+    acceptProps: { label: "Clear", severity: "danger" },
+    rejectProps: { label: "Cancel", severity: "secondary", outlined: true },
+    accept: clearAllJobs
+  });
+}
+
+async function clearAllJobs() {
+  clearing.value = true;
+  try {
+    const { deleted, skipped } = await $fetch<{ deleted: number; skipped: number }>("/api/queue", { method: "delete" });
+    toast.add({
+      severity: "success",
+      summary: "Jobs cleared",
+      detail: `${deleted} deleted${skipped ? `, ${skipped} running job(s) kept` : ""}`,
+      life: 5000
+    });
+    page.value = 1;
+  } catch (error) {
+    console.error("Clearing jobs failed:", error);
+    toast.add({ severity: "error", summary: "Could not clear jobs", detail: String(error), life: 10000 });
+  } finally {
+    clearing.value = false;
+    await refresh();
+  }
 }
 
 async function requeueJob(jobId: string) {
