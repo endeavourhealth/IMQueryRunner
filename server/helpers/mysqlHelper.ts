@@ -151,6 +151,26 @@ export async function deleteJobData(job: Job) {
   });
 }
 
+/**
+ * Deletes every job owned by `userId`, with everything each one produced. RUNNING jobs are left alone (the worker is still writing to them)
+ * and reported as skipped. Jobs are deleted one at a time, so a failure part-way leaves the rest intact and the call can simply be retried.
+ */
+export async function deleteAllJobsForUser(userId: string): Promise<{ deleted: number; skipped: number }> {
+  const jobs = await mysqlDb.select().from(jobTable).where(eq(jobTable.userId, userId));
+  let deleted = 0;
+  let skipped = 0;
+  for (const job of jobs) {
+    if (job.status === JobStatus.RUNNING) {
+      skipped++;
+      continue;
+    }
+    await deleteJobData(job);
+    deleted++;
+  }
+  if (deleted) emitQueueUpdate(userId);
+  return { deleted, skipped };
+}
+
 /** Row counts of completed results. Keyed by result id only, so callers must check job ownership before asking for a page. */
 const resultCountCache = new TtlCache<number>(10 * 60 * 1000, 1000);
 

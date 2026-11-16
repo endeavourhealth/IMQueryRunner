@@ -1,5 +1,5 @@
 import { JobStatus } from "~~/enums";
-import { DELETE_BATCH_SIZE, deleteJobData } from "~~/server/helpers/mysqlHelper";
+import { DELETE_BATCH_SIZE, deleteAllJobsForUser, deleteJobData } from "~~/server/helpers/mysqlHelper";
 
 import { getTableName } from "drizzle-orm";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -35,7 +35,8 @@ vi.mock("~~/server/db/mysql", () => {
     }
   };
 });
-vi.mock("#server/utils/queueEvents.ts", () => ({ emitQueueUpdate: vi.fn() }));
+const { emitQueueUpdate } = vi.hoisted(() => ({ emitQueueUpdate: vi.fn() }));
+vi.mock("#server/utils/queueEvents.ts", () => ({ emitQueueUpdate }));
 vi.mock("~~/server/services/EntityService", () => ({ default: {} }));
 vi.mock("~~/server/services/QueryService", () => ({ default: {} }));
 vi.mock("~~/server/utils/executeQuery", () => ({ resolveArgs: vi.fn(), sortQueryRequestsByDependency: vi.fn() }));
@@ -74,5 +75,38 @@ describe("deleteJobData", () => {
     await deleteJobData(job(JobStatus.COMPLETED));
     expect(state.deletes).toEqual(["cohort_results", "cohort_results", "dataset_results"]);
     expect(state.transactionDeletes).toEqual(["query_dependency", "query_result", "indicator_result", "query_result_set", "job"]);
+  });
+});
+
+describe("deleteAllJobsForUser", () => {
+  beforeEach(() => {
+    state.selects = [];
+    state.batchAffected = [];
+    state.deletes.length = 0;
+    state.transactionDeletes.length = 0;
+    emitQueueUpdate.mockClear();
+  });
+
+  it("deletes every job that is not running and reports running ones as skipped", async () => {
+    // the user's jobs, then one empty result-set lookup per deleted job
+    state.selects = [
+      [
+        { id: 1, status: JobStatus.COMPLETED },
+        { id: 2, status: JobStatus.RUNNING },
+        { id: 3, status: JobStatus.QUEUED }
+      ],
+      [],
+      []
+    ];
+    await expect(deleteAllJobsForUser("user-1")).resolves.toEqual({ deleted: 2, skipped: 1 });
+    expect(state.transactionDeletes).toEqual(["job", "job"]);
+    expect(emitQueueUpdate).toHaveBeenCalledWith("user-1");
+  });
+
+  it("does nothing when the user has no jobs", async () => {
+    state.selects = [[]];
+    await expect(deleteAllJobsForUser("user-1")).resolves.toEqual({ deleted: 0, skipped: 0 });
+    expect(state.transactionDeletes).toEqual([]);
+    expect(emitQueueUpdate).not.toHaveBeenCalled();
   });
 });
