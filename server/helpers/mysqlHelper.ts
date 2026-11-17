@@ -465,3 +465,11 @@ export function getToday() {
 export function getNow() {
   return new Date();
 }
+
+/** The distinct entity ids of a completed COHORT or DATASET result, as strings. */
+export async function getResultEntityIds(queryResultId: number, queryType: IMQType): Promise<string[]> {
+  const table = queryType === IMQType.COHORT ? cohortResultsTable : queryType === IMQType.DATASET ? datasetResultsTable : undefined;
+  if (!table) return [];
+  const rows = await mysqlDb.selectDistinct({ entityId: table.entityId }).from(table).where(eq(table.queryResultId, queryResultId));
+  return rows.map(r => String(r.entityId));
+}

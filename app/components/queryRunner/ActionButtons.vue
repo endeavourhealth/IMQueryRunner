@@ -1,6 +1,13 @@
 <template>
   <div class="flex items-center gap-1">
     <Button
+      icon="fa-duotone fa-solid fa-diagram-venn"
+      class="p-button-rounded p-button-text p-button-plain activity-row-button"
+      @click="showComparisonDialog = true"
+      v-tooltip.top="'Compare with CSV'"
+      data-testid="compare-query-button"
+    />
+    <Button
       icon="fa-duotone fa-solid fa-magnifying-glass"
       class="p-button-rounded p-button-text p-button-plain activity-row-button"
       @click="goToQuery"
@@ -53,6 +60,7 @@
       data-testid="delete-query-button"
     />
   </div>
+  <QueryComparisonDialog v-model:visible="showComparisonDialog" :job="job" />
   <Dialog
     v-model:visible="showErrorDialog"
     modal
@@ -91,6 +99,7 @@ import { IMQType } from "@endeavour/vue-library/enums";
 import type { MenuItem } from "primevue/menuitem";
 import { useConfirm } from "primevue/useconfirm";
 
+import QueryComparisonDialog from "./QueryComparisonDialog.vue";
 import SQLViewer from "./SQLViewer.vue";
 
 interface Props {
@@ -111,6 +120,7 @@ const emit = defineEmits({
 const confirm = useConfirm();
 
 const showErrorDialog = ref(false);
+const showComparisonDialog = ref(false);
 const viewResultsMenuItems: Ref<any[]> = ref([]);
 const viewResultsMenu = ref();
 const resultLoading = ref(false);

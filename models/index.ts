@@ -7,3 +7,4 @@ export type { QueryResultSummary } from "./QueryResultSummary.schema.ts";
 export type { QueueUpdate } from "./QueueUpdate";
 export type { UserPreferences } from "./userPreferences.schema";
 export type { JobQueueMessage, PlannedQueryRequest } from "./jobQueueMessage.schema";
+export type { ComparisonPatient, ComparisonQueryRow } from "./comparison.schema";
