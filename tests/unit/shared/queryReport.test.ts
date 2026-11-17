@@ -136,6 +136,58 @@ describe("runQueries", () => {
     const [report] = await runQueries(failing, [query], options);
     expect(report).toMatchObject({ status: "ERRORED", error: "bad sql" });
   });
+
+  it("runs each query against the chosen organisations and search date", async () => {
+    const added: { queryRequests: unknown[] }[] = [];
+    const recording: QueryReportApi = { ...api({ status: "COMPLETED" }, [summary("a")]), addJob: async body => (added.push(body), { jobId: 1 }) };
+    await runQueries(recording, [query], { ...options, searchDate: "2026-01-01", organisationIds: ["1", "2"] });
+    expect(added[0]!.queryRequests).toEqual([
+      {
+        query: { iri: iri("a") },
+        argument: [
+          { parameter: "$searchDate", valueData: "2026-01-01" },
+          { parameter: "$organisationId", valueDataList: ["1", "2"] }
+        ]
+      }
+    ]);
+  });
+
+  describe("singleJob", () => {
+    const queries = ["a", "b", "c"].map(name => ({ spec: "s.md", iri: iri(name), label: name, expectedCount: "" }));
+
+    it("sends every query once, as the requests of one job", async () => {
+      const added: { jobName: string; queryRequests: unknown[] }[] = [];
+      const recording: QueryReportApi = {
+        ...api(
+          { status: "COMPLETED" },
+          queries.map(q => summary(q.label))
+        ),
+        addJob: async body => (added.push(body), { jobId: 7 })
+      };
+      const reports = await runQueries(recording, [...queries, queries[0]!], { ...options, singleJob: true, searchDate: "2026-01-01" });
+      expect(added).toHaveLength(1);
+      expect(added[0]!.queryRequests).toEqual(queries.map(q => ({ query: { iri: q.iri }, argument: [{ parameter: "$searchDate", valueData: "2026-01-01" }] })));
+      expect(reports.map(r => [r.status, r.jobId])).toEqual(Array(4).fill(["COMPLETED", 7]));
+    });
+
+    it("gives each query its own status and count, and the job's error to the one that errored", async () => {
+      const summaries = [
+        summary("a", { totalCount: 3 }),
+        summary("b", { status: "ERRORED", totalCount: null } as Partial<QueryResultSummary>),
+        summary("c", { status: "CANCELLED", totalCount: null } as Partial<QueryResultSummary>)
+      ];
+      const reports = await runQueries(
+        api({ error: { message: "bad sql", cause: { sqlMessage: "syntax" } } }, summaries),
+        [{ ...queries[0]!, expectedCount: "4" }, queries[1]!, queries[2]!],
+        { ...options, singleJob: true }
+      );
+      expect(reports.map(r => [r.status, r.count, r.error, r.sqlError])).toEqual([
+        ["COUNT_MISMATCH", 3, undefined, undefined],
+        ["ERRORED", null, "bad sql", "syntax"],
+        ["CANCELLED", null, "Cancelled when another query in the job errored", undefined]
+      ]);
+    });
+  });
 });
 
 describe("htmlReport", () => {
