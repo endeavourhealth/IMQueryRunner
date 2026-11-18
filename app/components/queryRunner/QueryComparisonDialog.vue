@@ -39,11 +39,11 @@
 <script setup lang="ts">
 import { parseCsv } from "~/helpers/csv";
 import { useComparisonStore } from "~/stores/comparisonStore";
-import type { Job } from "~~/models";
 
 import type { FileUploadSelectEvent } from "primevue/fileupload";
 
-const props = defineProps<{ job: Job }>();
+/** The query (or sub query) of a job whose results are compared */
+const props = defineProps<{ jobId: number; queryIri: string; queryType: string }>();
 const visible = defineModel<boolean>("visible", { default: false });
 
 const comparisonStore = useComparisonStore();
@@ -78,12 +78,10 @@ function reset() {
 }
 
 async function compare() {
-  const query = props.job.queryRequests[0]?.query;
-  if (!query?.iri || !query.queryType) throw createError("Job query requests must have an iri and query type");
   const index = headers.value.indexOf(idColumn.value!);
   const ids = rows.value.map(r => r[index]?.trim() ?? "").filter(Boolean);
   comparisonStore.setCsvIds(ids, fileName.value);
   visible.value = false;
-  await navigateTo(`/compare/${props.job.id}/${query.queryType}/${encodeURIComponent(query.iri)}`);
+  await navigateTo(`/compare/${props.jobId}/${props.queryType}/${encodeURIComponent(props.queryIri)}`);
 }
 </script>
