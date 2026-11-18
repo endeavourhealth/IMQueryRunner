@@ -1,5 +1,5 @@
 import { ErrorCode } from "~~/enums";
-import { PatientInclusionRequestSchema } from "~~/models/patientInclusion.schema";
+import { PatientInclusionNodeSchema, PatientInclusionRequestSchema } from "~~/models/patientInclusion.schema";
 import { createLookups } from "~~/server/helpers/jobSummaries";
 import { getJobForUser } from "~~/server/helpers/mysqlHelper";
 import { getPatientInclusionTree, loadJobResultSummaries } from "~~/server/helpers/patientInclusion";
@@ -10,6 +10,7 @@ const paramSchema = z.object({
   jobId: z.coerce.number()
 });
 
+/** Which of a query's results (the query and each of its sub queries, as a tree) include one patient. */
 export default defineEventHandler(async event => {
   const { user } = await requireAuth(event);
   const accessToken = await getAccessToken(event);
@@ -28,5 +29,12 @@ export default defineEventHandler(async event => {
   const summaries = await loadJobResultSummaries(job.id);
   const { entityName } = createLookups(accessToken, user.id);
 
-  return getPatientInclusionTree(job.id, patientId, rootQuery, summaries, entityName);
+  // A name that cannot be looked up shows its iri rather than failing the whole tree
+  const nameOrIri = (iri: string) =>
+    entityName(iri).then(
+      name => name || iri,
+      () => iri
+    );
+
+  return PatientInclusionNodeSchema.parse(await getPatientInclusionTree(job.id, patientId, rootQuery, summaries, nameOrIri));
 });

@@ -52,6 +52,8 @@ export async function loadJobResultSummaries(jobId: number): Promise<QueryResult
             rows.map(row => row.id)
           )
         )
+        // Sub queries in the order they were recorded, so the tree is the same each time
+        .orderBy(asc(queryDependencyTable.parentQueryResultId), asc(queryDependencyTable.subQueryResultId))
     : [];
 
   const subQueryResultIdsById = Map.groupBy(dependencies, dependency => dependency.parentQueryResultId);

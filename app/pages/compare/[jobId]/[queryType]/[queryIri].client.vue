@@ -27,7 +27,7 @@
           :header="`${section.title} (${section.ids.length})`"
           :data-testid="`comparison-${section.key}`"
         >
-          <ComparisonTreeTable :patients="section.patients" />
+          <ComparisonTreeTable :jobId="route.params.jobId as string" :queryIri="route.params.queryIri as string" :patients="section.patients" />
         </Panel>
       </div>
     </template>
@@ -37,7 +37,7 @@
 <script setup lang="ts">
 import ComparisonTreeTable from "~/components/queryRunner/ComparisonTreeTable.vue";
 import { useComparisonStore } from "~/stores/comparisonStore";
-import type { ComparisonPatient, Job } from "~~/models";
+import type { ComparisonContext, ComparisonPatient } from "~~/models";
 
 import type { Argument } from "@endeavour/vue-library/models";
 
@@ -119,7 +119,7 @@ function viewResults() {
   navigateTo(`/results/${jobId}/${queryType}/${encodeURIComponent(queryIri as string)}`);
 }
 
-// TODO: replace with the per patient query and sub query details once they can be loaded; for now each patient has no children
+/** The tree table loads each patient's query and sub query details when their row is expanded */
 function toPatients(ids: string[]): ComparisonPatient[] {
   return ids.map(entityId => ({ entityId }));
 }
@@ -128,15 +128,12 @@ onMounted(async () => {
   if (!comparisonStore.csvIds.length) return;
   const { jobId, queryType, queryIri } = route.params;
   try {
-    const [ids, job] = await Promise.all([
-      $fetch<string[]>(`/api/queue/job/results/${jobId}/${queryType}/${encodeURIComponent(queryIri as string)}/ids`),
-      $fetch<Job>(`/api/queue/job/${jobId}`)
-    ]);
+    const base = `/api/queue/job/results/${jobId}/${queryType}/${encodeURIComponent(queryIri as string)}`;
+    // The context has the name and arguments of the compared query, which can be a sub query: those ran with their top level query's arguments
+    const [ids, context] = await Promise.all([$fetch<string[]>(`${base}/ids`), $fetch<ComparisonContext>(`${base}/context`)]);
     resultIds.value = ids;
-    // The compared query, which is not always the job's first
-    const queryRequest = job.queryRequests.find(qr => qr.query?.iri === queryIri);
-    queryName.value = queryRequest?.query?.name ?? "";
-    queryArguments.value = queryRequest?.argument ?? [];
+    queryName.value = context.queryName;
+    queryArguments.value = context.arguments;
   } catch (e: any) {
     error.value = e?.data?.message ?? "Could not load the results";
   } finally {
