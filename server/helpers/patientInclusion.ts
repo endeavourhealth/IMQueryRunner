@@ -186,6 +186,7 @@ export async function getPatientInclusionTree(
     return {
       iri: summary.queryIri,
       name: names.get(summary.queryIri) ?? "",
+      queryType: summary.queryType,
       found: found(summary, includingPatient),
       children: subQueriesOf(summary)
         .filter(sub => !path.has(sub))

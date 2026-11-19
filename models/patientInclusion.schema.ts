@@ -1,3 +1,4 @@
+import { IMQType } from "@endeavour/vue-library/enums";
 import { QueryRequestSchema } from "@endeavour/vue-library/models";
 
 import { z } from "zod";
@@ -21,6 +22,7 @@ export type PatientInclusionRequest = z.output<typeof PatientInclusionRequestSch
 export interface PatientInclusionNode {
   iri: string;
   name: string;
+  queryType: IMQType;
   /** null when it is not known: an indicator (no result rows of its own) or a query that did not complete */
   found: boolean | null;
   children: PatientInclusionNode[];
@@ -29,6 +31,7 @@ export interface PatientInclusionNode {
 export const PatientInclusionNodeSchema: z.ZodType<PatientInclusionNode> = z.strictObject({
   iri: z.url(),
   name: z.string(),
+  queryType: z.enum(IMQType),
   found: z.boolean().nullable(),
   get children() {
     return z.array(PatientInclusionNodeSchema);

@@ -26,20 +26,22 @@
     </Column>
     <Column class="w-24">
       <template #body="{ node }">
-        <div v-if="node.data.patient" class="flex items-center justify-end gap-1">
+        <div v-if="typeof node.data.found === 'boolean'" class="flex items-center justify-end gap-1">
           <Button
-            :icon="debugRuns.has(node.key) ? 'fa-solid fa-spinner fa-spin' : 'fa-solid fa-play'"
+            :icon="debugRuns.has(debugKey(node)) ? 'fa-solid fa-spinner fa-spin' : 'fa-solid fa-play'"
+            severity="success"
             class="p-button-rounded p-button-text"
-            :disabled="debugRuns.has(node.key) || debugJobIds.has(node.key)"
-            @click="runDebug(node.key)"
-            v-tooltip.left="runTooltip(node.key)"
+            :pt="{ icon: { class: 'text-green-500' } }"
+            :disabled="debugRuns.has(debugKey(node)) || debugJobIds.has(debugKey(node))"
+            @click="runDebug(node)"
+            v-tooltip.left="runTooltip(node)"
             data-testid="comparison-debug-run"
           />
           <Button
-            v-if="debugJobIds.has(node.key)"
+            v-if="debugJobIds.has(debugKey(node))"
             icon="fa-duotone fa-solid fa-list"
             class="p-button-rounded p-button-text p-button-plain"
-            @click="viewResults(debugJobIds.get(node.key)!)"
+            @click="viewResults(node)"
             v-tooltip.left="'View results'"
             data-testid="comparison-debug-results"
           />
@@ -61,13 +63,11 @@ const props = withDefaults(
   defineProps<{
     jobId: number | string;
     queryIri: string;
-    queryType: string;
-    queryName?: string;
     queryArguments?: Argument[];
     patients: ComparisonPatient[];
     rows?: number;
   }>(),
-  { rows: 25, queryName: "", queryArguments: () => [] }
+  { rows: 25, queryArguments: () => [] }
 );
 
 const toast = useToast();
@@ -92,11 +92,11 @@ const nodes = computed<TreeNode[]>(() =>
     const inclusion = inclusions.get(entityId);
     return {
       key: entityId,
-      data: { name: entityId, found: null, patient: true },
+      data: { name: entityId, found: null },
       leaf: false,
       loading: inclusion?.loading ?? false,
       children: inclusion?.tree
-        ? [queryNode(inclusion.tree, entityId)]
+        ? [queryNode(inclusion.tree, entityId, entityId)]
         : inclusion?.error
           ? [{ key: `${entityId}/error`, data: { name: inclusion.error, found: null, error: true }, leaf: true }]
           : []
@@ -105,13 +105,13 @@ const nodes = computed<TreeNode[]>(() =>
 );
 
 /** Keyed by position as well as iri: the same sub query can appear more than once in a tree */
-function queryNode(query: PatientInclusionNode, parentKey: string, index = 0): TreeNode {
+function queryNode(query: PatientInclusionNode, entityId: string, parentKey: string, index = 0): TreeNode {
   const key = `${parentKey}/${index}:${query.iri}`;
   return {
     key,
-    data: { name: query.name || query.iri, iri: query.iri, found: query.found },
+    data: { name: query.name || query.iri, iri: query.iri, queryType: query.queryType, found: query.found, entityId },
     leaf: !query.children.length,
-    children: query.children.map((child, i) => queryNode(child, key, i))
+    children: query.children.map((child, i) => queryNode(child, entityId, key, i))
   };
 }
 
@@ -135,39 +135,42 @@ async function onNodeExpand(node: TreeNode) {
   }
 }
 
-function runTooltip(entityId: string): string {
-  if (debugRuns.has(entityId)) return "Running in debug mode";
-  if (debugJobIds.has(entityId)) return "Already run in debug mode";
-  return "Run in debug mode for this patient";
+function debugKey(node: TreeNode): string {
+  return `${node.data.entityId}|${node.data.iri}`;
 }
 
-async function runDebug(entityId: string) {
-  if (debugRuns.has(entityId) || debugJobIds.has(entityId)) return;
-  if (!/^\d+$/.test(entityId)) {
-    toast.add({ severity: "warn", summary: "Cannot run in debug mode", detail: `"${entityId}" is not a valid patient id`, life: 5000 });
-    return;
-  }
-  debugRuns.add(entityId);
+function runTooltip(node: TreeNode): string {
+  if (debugRuns.has(debugKey(node))) return "Running in debug mode";
+  if (debugJobIds.has(debugKey(node))) return "Already run in debug mode";
+  return "Run this query in debug mode for this patient";
+}
+
+async function runDebug(node: TreeNode) {
+  const key = debugKey(node);
+  if (debugRuns.has(key) || debugJobIds.has(key)) return;
+  const { entityId, iri, name } = node.data;
+  debugRuns.add(key);
   try {
-    const job = await runDebugJob(entityId);
-    if (job) debugJobIds.set(entityId, job.id);
+    const job = await runDebugJob(entityId, iri, name);
+    if (job) debugJobIds.set(key, job.id);
   } catch (e: any) {
     if (!unmounted)
       toast.add({ severity: "error", summary: `Debug run for patient ${entityId}`, detail: e?.data?.message ?? e?.message ?? String(e), life: 10000 });
   } finally {
-    debugRuns.delete(entityId);
+    debugRuns.delete(key);
   }
 }
 
-function viewResults(jobId: number) {
-  window.open(`/results/${jobId}/${props.queryType}/${encodeURIComponent(props.queryIri)}`, "_blank");
+function viewResults(node: TreeNode) {
+  const jobId = debugJobIds.get(debugKey(node));
+  if (jobId) window.open(`/results/${jobId}/${node.data.queryType}/${encodeURIComponent(node.data.iri)}`, "_blank");
 }
 
-async function runDebugJob(entityId: string): Promise<Job | undefined> {
+async function runDebugJob(entityId: string, iri: string, name: string): Promise<Job | undefined> {
   const argument = [...props.queryArguments.filter(arg => arg.parameter !== debugPatientParameter), { parameter: debugPatientParameter, valueData: entityId }];
   const jobRequest = {
-    jobName: `Debug patient ${entityId}: ${props.queryName || props.queryIri}`,
-    queryRequests: [{ query: { iri: props.queryIri }, argument }]
+    jobName: `Debug patient ${entityId}: ${name || iri}`,
+    queryRequests: [{ query: { iri }, argument }]
   } as JobRequest;
   const queued = await $fetch<{ jobId?: number } | undefined>("/api/queue/job/add", { method: "POST", body: jobRequest });
   if (!queued?.jobId) throw new Error("The debug run could not be queued");

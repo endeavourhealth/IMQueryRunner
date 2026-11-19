@@ -30,8 +30,6 @@
           <ComparisonTreeTable
             :jobId="route.params.jobId as string"
             :queryIri="route.params.queryIri as string"
-            :queryType="route.params.queryType as string"
-            :queryName="queryName"
             :queryArguments="queryArguments"
             :patients="section.patients"
           />

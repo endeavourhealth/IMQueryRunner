@@ -43,7 +43,6 @@
       data-testid="view-query-results-button"
     />
     <Menu ref="viewResultsMenu" id="view-results-menu" :model="viewResultsMenuItems" :popup="true" />
-
     <Button
       icon="fa-duotone fa-solid fa-trash"
       severity="danger"
@@ -81,7 +80,7 @@
 
 <script setup lang="ts">
 import { JobStatus } from "@@/enums";
-import type { Job, JobRequest, QueryResultSummary } from "~~/models";
+import type { Job, QueryResultSummary } from "~~/models";
 
 import { ref } from "vue";
 
