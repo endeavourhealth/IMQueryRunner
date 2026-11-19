@@ -4,6 +4,7 @@ import { ErrorCode, JobStatus } from "~~/enums";
 import { type JobRequest } from "~~/models/JobRequest";
 import { type IndicatorResult } from "~~/models/indicatorResult.schema";
 import { type Job } from "~~/models/job.schema";
+import { type PlannedQueryRequest } from "~~/models/jobQueueMessage.schema";
 import { type QueryResult } from "~~/models/queryResult.schema";
 import { type QueryResultSet } from "~~/models/queryResultSet.schema";
 
@@ -11,7 +12,7 @@ import { isArrayHasLength } from "@endeavour/vue-library";
 import { IMQType } from "@endeavour/vue-library/enums";
 import { type QueryRequest } from "@endeavour/vue-library/models";
 
-import { and, asc, count, eq, inArray, or } from "drizzle-orm";
+import { and, asc, count, eq, inArray, isNull, or } from "drizzle-orm";
 import { type MySqlTableWithColumns } from "drizzle-orm/mysql-core";
 
 import { mysqlDb } from "../db/mysql";
@@ -26,7 +27,7 @@ import {
   queryResultTable
 } from "../db/mysql/schema";
 import QueryService from "../services/QueryService";
-import { resolveArgs, sortQueryRequestsByDependency } from "../utils/executeQuery";
+import { hashQueryRequest, resolveArgs, sortQueryRequestsByDependency } from "../utils/executeQuery";
 import { TtlCache } from "../utils/memoryCache";
 
 const LOG = Logger("server/helpers/mysqlHelper");
@@ -40,8 +41,9 @@ export async function createJobEntry(jobRequest: JobRequest, accessToken: string
   }
   const orderedQueryRequests = await sortQueryRequestsByDependency(accessToken!, queryRequestsForSql);
   const now = getNow();
+  const firstQueryName = queryRequestsForSql[0]?.query?.name;
   const queryJob = {
-    jobName: jobRequest.jobName || queryRequestsForSql[0]?.query?.name || "Unnamed Job",
+    jobName: jobRequest.jobName || (firstQueryName ? `Job ${firstQueryName}` : "Unnamed Job"),
     queryRequests: orderedQueryRequests,
     startOfDaySnapshot: jobRequest.startOfDaySnapshot ? 1 : 0,
     persistent: jobRequest.persistent ? 1 : 0,
@@ -59,9 +61,14 @@ export async function createJobEntry(jobRequest: JobRequest, accessToken: string
   return queryJob;
 }
 
-export async function getJobById(jobId: number): Promise<Job> {
+/** The job, or undefined when there is none (e.g. it was deleted while its messages were still queued). For the queue consumer. */
+export async function findJobById(jobId: number): Promise<Job | undefined> {
   const jobs = await mysqlDb.select().from(jobTable).where(eq(jobTable.id, jobId));
-  const job = jobs[0];
+  return jobs[0];
+}
+
+export async function getJobById(jobId: number): Promise<Job> {
+  const job = await findJobById(jobId);
   if (!job) {
     throw createError({ status: 400, statusText: ErrorCode.MissingDataError, message: "Queue job not found" });
   }
@@ -144,6 +151,26 @@ export async function deleteJobData(job: Job) {
   });
 }
 
+/**
+ * Deletes every job owned by `userId`, with everything each one produced. RUNNING jobs are left alone (the worker is still writing to them)
+ * and reported as skipped. Jobs are deleted one at a time, so a failure part-way leaves the rest intact and the call can simply be retried.
+ */
+export async function deleteAllJobsForUser(userId: string): Promise<{ deleted: number; skipped: number }> {
+  const jobs = await mysqlDb.select().from(jobTable).where(eq(jobTable.userId, userId));
+  let deleted = 0;
+  let skipped = 0;
+  for (const job of jobs) {
+    if (job.status === JobStatus.RUNNING) {
+      skipped++;
+      continue;
+    }
+    await deleteJobData(job);
+    deleted++;
+  }
+  if (deleted) emitQueueUpdate(userId);
+  return { deleted, skipped };
+}
+
 /** Row counts of completed results. Keyed by result id only, so callers must check job ownership before asking for a page. */
 const resultCountCache = new TtlCache<number>(10 * 60 * 1000, 1000);
 
@@ -154,15 +181,15 @@ export interface PagedResults {
 }
 
 /**
- * Id of the result for `queryIri` in a job, taken from the earliest result set that has one. Joins through
- * query_result_set in a single query rather than loading the result sets first.
+ * Id of the completed result for `queryIri` in a job, taken from the earliest result set that has one. A job that stopped part way still has
+ * the results of the queries that finished. Joins through query_result_set in a single query rather than loading the result sets first.
  */
 export async function getQueryResultIdForJob(jobId: number, queryIri: string): Promise<number | undefined> {
   const rows = await mysqlDb
     .select({ id: queryResultTable.id })
     .from(queryResultTable)
     .innerJoin(queryResultSetTable, eq(queryResultTable.queryResultSetId, queryResultSetTable.id))
-    .where(and(eq(queryResultSetTable.jobId, jobId), eq(queryResultTable.queryIri, queryIri)))
+    .where(and(eq(queryResultSetTable.jobId, jobId), eq(queryResultTable.queryIri, queryIri), eq(queryResultTable.status, JobStatus.COMPLETED)))
     .orderBy(asc(queryResultSetTable.id), asc(queryResultTable.id))
     .limit(1);
   return rows[0]?.id;
@@ -211,8 +238,8 @@ export async function getQueryResultRow(queryResultSetId: number, queryIri: stri
 }
 
 /**
- * The SQL that was run for `queryIri` in a job, taken from the earliest result set that has it (the same rule as
- * `getQueryResultIdForJob`). Undefined when the job has no such result; an empty string when it has one with no SQL recorded.
+ * The SQL that was run for `queryIri` in a job, taken from the earliest result set that has it: a query that never ran shares its iri with one
+ * that did, but has no SQL. Undefined when the job has no such result; an empty string when it has one with no SQL recorded.
  */
 export async function getExecutedSqlForJob(jobId: number, queryIri: string): Promise<string | undefined> {
   const rows = await mysqlDb
@@ -220,7 +247,7 @@ export async function getExecutedSqlForJob(jobId: number, queryIri: string): Pro
     .from(queryResultTable)
     .innerJoin(queryResultSetTable, eq(queryResultTable.queryResultSetId, queryResultSetTable.id))
     .where(and(eq(queryResultSetTable.jobId, jobId), eq(queryResultTable.queryIri, queryIri)))
-    .orderBy(asc(queryResultSetTable.id), asc(queryResultTable.id))
+    .orderBy(isNull(queryResultTable.executedSQL), asc(queryResultSetTable.id), asc(queryResultTable.id))
     .limit(1);
   return rows[0] ? (rows[0].executedSql ?? "") : undefined;
 }
@@ -281,6 +308,47 @@ export async function createResultSetEntry(queryRequest: any, job: Job): Promise
   return queryResultSet;
 }
 
+/**
+ * Creates every request's result set and result (or indicator result) before any of them runs, so the whole job shows from the start, a
+ * request that never gets to run still has a status, and each request can find the results of the job's other requests whatever order
+ * they run in. Done once per job, before its requests are sent to the queue one message each.
+ */
+export async function planJob(job: Job): Promise<PlannedQueryRequest[]> {
+  const planned: PlannedQueryRequest[] = [];
+  for (const queryRequest of job.queryRequests) {
+    const queryResultSet = await createResultSetEntry(queryRequest, job);
+    const hashCodeVersion = hashQueryRequest(queryRequest);
+    let indicatorResultId: number | null = null;
+    if (queryRequest.query?.queryType === IMQType.INDICATOR) {
+      indicatorResultId = await createIndicatorResultEntry(queryRequest, queryResultSet, hashCodeVersion);
+    } else {
+      await createQueryResultEntry(queryRequest, queryResultSet, hashCodeVersion);
+    }
+    planned.push({ queryRequest, queryResultSetId: queryResultSet.id!, indicatorResultId });
+  }
+  return planned;
+}
+
+/** A result set of the job, in the shape the runner works with. Fails if it does not belong to the job. */
+export async function getResultSetForJob(queryResultSetId: number, job: Job): Promise<QueryResultSet> {
+  const rows = await mysqlDb
+    .select()
+    .from(queryResultSetTable)
+    .where(and(eq(queryResultSetTable.id, queryResultSetId), eq(queryResultSetTable.jobId, job.id)));
+  const row = rows[0];
+  if (!row) throw new Error(`Query result set ${queryResultSetId} not found for job ${job.id}`);
+  return { ...row, userId: job.userId } as QueryResultSet;
+}
+
+/** Whether any of the job's result sets has not finished yet. A job is complete once none has. */
+export async function hasOpenResultSets(jobId: number): Promise<boolean> {
+  const rows = await mysqlDb
+    .select({ total: count() })
+    .from(queryResultSetTable)
+    .where(and(eq(queryResultSetTable.jobId, jobId), isNull(queryResultSetTable.endTime)));
+  return (rows[0]?.total ?? 0) > 0;
+}
+
 export async function createQueryResultEntry(queryRequest: QueryRequest, queryResultSet: QueryResultSet, hashCodeVersion: number, indicatorId?: number) {
   switch (queryRequest.query?.queryType) {
     case IMQType.COHORT:
@@ -289,14 +357,14 @@ export async function createQueryResultEntry(queryRequest: QueryRequest, queryRe
         startOfDaySnapshot: queryResultSet.startOfDaySnapshot,
         persistent: queryResultSet.persistent,
         useStartOfDaySnapshot: queryResultSet.useStartOfDaySnapshot,
-        startTime: getNow(),
         queryIri: queryRequest.query.iri,
         searchDate: queryResultSet.searchDate ? new Date(queryResultSet.searchDate) : null,
         achievementDate: queryResultSet.achievementDate ? new Date(queryResultSet.achievementDate) : null,
         indicatorResultId: indicatorId,
         queryResultSetId: queryResultSet.id,
         version: hashCodeVersion,
-        queryType: queryRequest.query.queryType
+        queryType: queryRequest.query.queryType,
+        status: JobStatus.QUEUED
       } as QueryResult;
       const result = await mysqlDb.insert(queryResultTable).values(queryResult);
       return result?.[0]?.insertId;
@@ -326,7 +394,6 @@ export async function createIndicatorResultEntry(queryRequest: QueryRequest, que
     startOfDaySnapshot: queryResultSet.startOfDaySnapshot,
     persistent: queryResultSet.persistent,
     useStartOfDaySnapshot: queryResultSet.useStartOfDaySnapshot,
-    startTime: getNow(),
     queryIri: queryRequest.query?.iri,
     searchDate: queryResultSet.searchDate ? new Date(queryResultSet.searchDate) : null,
     achievementDate: queryResultSet.achievementDate ? new Date(queryResultSet.achievementDate) : null,
@@ -335,6 +402,42 @@ export async function createIndicatorResultEntry(queryRequest: QueryRequest, que
   } as IndicatorResult;
   const result = await mysqlDb.insert(indicatorResultTable).values(indicatorResult);
   return result?.[0]?.insertId;
+}
+
+export async function markQueryResultRunning(id: number, queryResultSet: QueryResultSet) {
+  await mysqlDb.update(queryResultTable).set({ status: JobStatus.RUNNING, startTime: getNow() }).where(eq(queryResultTable.id, id));
+  emitQueueUpdate(queryResultSet.userId, { jobId: queryResultSet.jobId });
+}
+
+export async function markQueryResultCompleted(id: number, queryResultSet: QueryResultSet) {
+  await mysqlDb.update(queryResultTable).set({ status: JobStatus.COMPLETED, endTime: getNow() }).where(eq(queryResultTable.id, id));
+  emitQueueUpdate(queryResultSet.userId, { jobId: queryResultSet.jobId });
+}
+
+/** After a job has failed: what was running failed with it, what was still waiting never ran. */
+export async function closeOpenQueryResults(jobId: number) {
+  const resultSetIds = (await mysqlDb.select({ id: queryResultSetTable.id }).from(queryResultSetTable).where(eq(queryResultSetTable.jobId, jobId))).map(
+    r => r.id
+  );
+  if (!resultSetIds.length) return;
+  const inJob = inArray(queryResultTable.queryResultSetId, resultSetIds);
+  await mysqlDb
+    .update(queryResultTable)
+    .set({ status: JobStatus.ERRORED, endTime: getNow() })
+    .where(and(inJob, eq(queryResultTable.status, JobStatus.RUNNING)));
+  await mysqlDb
+    .update(queryResultTable)
+    .set({ status: JobStatus.CANCELLED })
+    .where(and(inJob, eq(queryResultTable.status, JobStatus.QUEUED)));
+}
+
+export async function updateWithStartTime(id: number, table: MySqlTableWithColumns<any>) {
+  await mysqlDb
+    .update(table)
+    .set({
+      startTime: getNow()
+    })
+    .where(eq(table.id, id));
 }
 
 export async function updateWithEndTime(id: number, table: MySqlTableWithColumns<any>) {
