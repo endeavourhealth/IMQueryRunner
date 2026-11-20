@@ -23,7 +23,6 @@
           v-for="section in sections"
           :key="section.key"
           toggleable
-          :collapsed="section.key === 'both'"
           :header="`${section.title} (${section.ids.length})`"
           :data-testid="`comparison-${section.key}`"
         >
@@ -55,21 +54,30 @@ const queryArguments = ref<Argument[]>([]);
 const loading = ref(true);
 const error = ref("");
 
-const sections = computed(() => {
+const comparison = computed(() => {
   const csv = new Set(comparisonStore.csvIds);
   const results = new Set(resultIds.value);
-  return [
-    { key: "csv-only", title: "In CSV only", ids: [...csv].filter(id => !results.has(id)) },
-    { key: "both", title: "In both", ids: [...csv].filter(id => results.has(id)) },
-    { key: "results-only", title: "In results only", ids: [...results].filter(id => !csv.has(id)) }
-  ].map(section => ({ ...section, patients: toPatients(section.ids) }));
+  return {
+    csvOnly: [...csv].filter(id => !results.has(id)),
+    both: [...csv].filter(id => results.has(id)).length,
+    resultsOnly: [...results].filter(id => !csv.has(id))
+  };
 });
+
+const sections = computed(() =>
+  [
+    { key: "csv-only", title: "In CSV only", ids: comparison.value.csvOnly },
+    { key: "results-only", title: "In results only", ids: comparison.value.resultsOnly }
+  ].map(section => ({ ...section, patients: toPatients(section.ids) }))
+);
 
 type OverviewItem = { label: string; value: string | number; note?: string };
 
 /** The overview's three columns: what was compared, the counts, and the query's arguments */
 const overview = computed<OverviewItem[][]>(() => {
-  const [csvOnly, both, resultsOnly] = sections.value.map(s => s.ids.length) as [number, number, number];
+  const csvOnly = comparison.value.csvOnly.length;
+  const resultsOnly = comparison.value.resultsOnly.length;
+  const both = comparison.value.both;
   const csvCount = csvOnly + both;
   const union = csvOnly + both + resultsOnly;
   const duplicates = comparisonStore.csvIds.length - csvCount;
