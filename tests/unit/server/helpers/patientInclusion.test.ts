@@ -66,16 +66,18 @@ describe("getPatientInclusionTree", () => {
     expect(tree).toEqual({
       iri: iri("A"),
       name: "name of A",
+      queryType: IMQType.COHORT,
       found: true,
       children: [
         {
           iri: iri("B"),
           name: "name of B",
+          queryType: IMQType.COHORT,
           found: false,
-          children: [{ iri: iri("D"), name: "name of D", found: null, children: [] }]
+          children: [{ iri: iri("D"), name: "name of D", queryType: IMQType.COHORT, found: null, children: [] }]
         },
         // C links back to A, which is already on the path, so the cycle stops here
-        { iri: iri("C"), name: "name of C", found: true, children: [] }
+        { iri: iri("C"), name: "name of C", queryType: IMQType.DATASET, found: true, children: [] }
       ]
     });
   });
