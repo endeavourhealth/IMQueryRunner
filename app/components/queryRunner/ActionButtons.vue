@@ -1,12 +1,5 @@
 <template>
   <div class="flex items-center gap-1">
-    <Button
-      icon="fa-duotone fa-solid fa-magnifying-glass"
-      class="p-button-rounded p-button-text p-button-plain activity-row-button"
-      @click="goToQuery"
-      v-tooltip.top="'View query'"
-      data-testid="view-query-button"
-    />
     <Menu ref="viewMultiQueryMenu" :model="viewMultiQueryMenuItems" popup class="w-40" />
     <Button
       v-if="job.status && [JobStatus.QUEUED, JobStatus.RUNNING].includes(job.status)"
@@ -23,7 +16,7 @@
       severity="warn"
       class="p-button-rounded p-button-text activity-row-button"
       @click="requeueQuery"
-      v-tooltip.left="'Requeue query'"
+      v-tooltip.left="'Requeue job'"
       data-testid="requeue-query-button"
     />
     <Button
@@ -33,14 +26,6 @@
       @click="showErrorDialog = true"
       v-tooltip.left="'Error details'"
       data-testid="show-error-button"
-    />
-    <Button
-      v-if="job.status === JobStatus.COMPLETED"
-      icon="fa-duotone fa-solid fa-list"
-      class="p-button-rounded p-button-text p-button-plain activity-row-button"
-      @click="openViewResultsMenuItems"
-      v-tooltip.left="'View results'"
-      data-testid="view-query-results-button"
     />
     <Menu ref="viewResultsMenu" id="view-results-menu" :model="viewResultsMenuItems" :popup="true" />
     <Button
