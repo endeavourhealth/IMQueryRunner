@@ -1,6 +1,6 @@
 /**
- * Runs every query listed in one or more gauge spec tables, each as its own job so one failing query does not take the others down,
- * and builds an HTML report with each query's iri, name, status and result count, plus the definition, executed SQL and SQL error for
+ * Runs every query listed in one or more gauge spec tables, each as its own job so one failing query does not take the others down
+ * (or, with `singleJob`, all of them as the requests of one job, as a user running them together would), and builds an HTML report with each query's iri, name, status and result count, plus the definition, executed SQL and SQL error for
  * any that did not pass. Queries that ran can be expanded to the sub queries they depended on, as in the UI's job table.
  *
  * Shared by the `pnpm test:queries` script (tests/queries/runQueries.js) and the "Query reports" menu in the UI (app/utils/queryReport.ts),
@@ -77,10 +77,14 @@ export interface DependencyNode {
 export interface RunOptions {
   /** Jobs in flight at once */
   concurrency: number;
-  /** ms per job */
+  /** ms per job; with singleJob, ms per query, so the one job gets this times the number of queries */
   timeout: number;
+  /** Send every query as a request of one job instead of a job each. The first query to fail errors the job and cancels the rest. */
+  singleJob?: boolean;
   /** yyyy-mm-dd sent as $searchDate; the server uses today when omitted */
   searchDate?: string;
+  /** Organisation ids sent as $organisationId, as "Search and run" does, to run the queries against those organisations only */
+  organisationIds?: string[];
   onProgress?: (done: number, total: number, result?: QueryReportResult) => void;
 }
 
@@ -150,12 +154,61 @@ export function dependencyGraph(summaries: QueryResultSummary[], iri: string): D
   return nodes;
 }
 
-async function runQuery(api: QueryReportApi, query: SpecQuery, timeout: number, searchDate?: string): Promise<QueryReportResult> {
+const time = (date: string | Date | null | undefined) => (date ? new Date(date).getTime() : undefined);
+
+function blankResult(query: SpecQuery): QueryReportResult {
+  return { ...query, name: query.label, status: "", count: null, jobId: null, durationMs: null, queuedMs: null };
+}
+
+/**
+ * Polls a job until it ends or the timeout passes. Jobs wait in the queue for a free consumer, so time from submission is not how long
+ * the job took. Finished jobs are timed from the server's own runDate/finishDate; a job still running at the timeout is timed from when
+ * this loop first saw it running.
+ */
+async function waitForJob(api: QueryReportApi, jobId: number, started: number, timeout: number) {
+  let job: QueryReportJob | undefined;
+  let seenRunning: number | undefined;
+  while (Date.now() - started < timeout) {
+    job = await api.getJob(jobId);
+    if (job.status !== "QUEUED") seenRunning ??= Date.now();
+    if (TERMINAL_STATUSES.includes(job.status)) break;
+    await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
+  }
+  const status = job && TERMINAL_STATUSES.includes(job.status) ? job.status : "TIMEOUT";
+  const now = Date.now();
+  const [queueDate, runDate, finishDate] = [time(job?.queueDate), time(job?.runDate), time(job?.finishDate)];
+  let durationMs: number | null = null;
+  if (runDate !== undefined && finishDate !== undefined) durationMs = Math.max(finishDate - runDate, 0);
+  else if (seenRunning !== undefined && status === "TIMEOUT") durationMs = now - seenRunning;
+  const queuedMs = queueDate !== undefined && runDate !== undefined ? Math.max(runDate - queueDate, 0) : (seenRunning ?? now) - started;
+  return { job, status, durationMs, queuedMs };
+}
+
+/** The arguments every query is run with. */
+export function queryArguments(options: Pick<RunOptions, "searchDate" | "organisationIds">) {
+  const args: { parameter: string; valueData?: string; valueDataList?: string[] }[] = [];
+  if (options.searchDate) args.push({ parameter: "$searchDate", valueData: options.searchDate });
+  if (options.organisationIds?.length) args.push({ parameter: "$organisationId", valueDataList: options.organisationIds });
+  return args;
+}
+
+/** The job error's message and the SQL it failed on, if any. */
+function jobErrorFields(job: QueryReportJob | undefined) {
+  const error = job?.error || {};
+  return {
+    error: error.message || JSON.stringify(error),
+    sqlError: error.cause?.sqlMessage || error.cause?.message || "",
+    executedSql: error.cause?.sql || ""
+  };
+}
+
+async function runQuery(api: QueryReportApi, query: SpecQuery, options: RunOptions): Promise<QueryReportResult> {
+  const { timeout } = options;
   const started = Date.now();
-  const result: QueryReportResult = { ...query, name: query.label, status: "", count: null, jobId: null, durationMs: null, queuedMs: null };
+  const result = blankResult(query);
 
   try {
-    const argument = searchDate ? [{ parameter: "$searchDate", valueData: searchDate }] : [];
+    const argument = queryArguments(options);
     const added = await api.addJob({ jobName: `[report] ${query.label || query.iri}`, queryRequests: [{ query: { iri: query.iri }, argument }] });
     if (!added?.jobId) {
       result.status = "SUBMIT_FAILED";
@@ -169,23 +222,8 @@ async function runQuery(api: QueryReportApi, query: SpecQuery, timeout: number, 
     return finish(api, result);
   }
 
-  // Jobs wait in the queue for a free consumer, so time from submission is not how long the query took. Finished jobs are timed from the
-  // server's own runDate/finishDate; a job still running at the timeout is timed from when this loop first saw it running.
-  let job: QueryReportJob | undefined;
-  let seenRunning: number | undefined;
-  while (Date.now() - started < timeout) {
-    job = await api.getJob(result.jobId);
-    if (job.status !== "QUEUED") seenRunning ??= Date.now();
-    if (TERMINAL_STATUSES.includes(job.status)) break;
-    await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
-  }
-  result.status = job && TERMINAL_STATUSES.includes(job.status) ? job.status : "TIMEOUT";
-  const now = Date.now();
-  const time = (date: string | Date | null | undefined) => (date ? new Date(date).getTime() : undefined);
-  const [queueDate, runDate, finishDate] = [time(job?.queueDate), time(job?.runDate), time(job?.finishDate)];
-  if (runDate !== undefined && finishDate !== undefined) result.durationMs = Math.max(finishDate - runDate, 0);
-  else if (seenRunning !== undefined && result.status === "TIMEOUT") result.durationMs = now - seenRunning;
-  result.queuedMs = queueDate !== undefined && runDate !== undefined ? Math.max(runDate - queueDate, 0) : (seenRunning ?? now) - started;
+  const { job, status, durationMs, queuedMs } = await waitForJob(api, result.jobId, started, timeout);
+  Object.assign(result, { status, durationMs, queuedMs });
 
   // Every outcome, as a job that failed or timed out is where the status of its sub queries matters most
   try {
@@ -208,14 +246,89 @@ async function runQuery(api: QueryReportApi, query: SpecQuery, timeout: number, 
   if (result.status === "COMPLETED") {
     if (query.expectedCount !== "" && String(result.count) !== query.expectedCount) result.status = "COUNT_MISMATCH";
   } else if (result.status === "ERRORED") {
-    const error = job?.error || {};
-    result.error = error.message || JSON.stringify(error);
-    result.sqlError = error.cause?.sqlMessage || error.cause?.message || "";
-    result.executedSql = error.cause?.sql || "";
+    Object.assign(result, jobErrorFields(job));
   } else if (result.status === "TIMEOUT") {
     result.error = `Job still "${job?.status}" after ${timeout}ms`;
   }
   return finish(api, result);
+}
+
+/**
+ * Runs every query as a request of one job. Each query's status, count and duration come from its own result in the job; how long the
+ * job was queued is shared by all. The job's error is given to the queries whose results errored, or to all that did not complete if
+ * none did (it failed before any ran). Queries the failure cancelled are reported as CANCELLED.
+ */
+async function runAsSingleJob(api: QueryReportApi, queries: SpecQuery[], options: RunOptions): Promise<QueryReportResult[]> {
+  const started = Date.now();
+  const timeout = options.timeout * queries.length;
+  const results = queries.map(blankResult);
+  options.onProgress?.(0, queries.length);
+
+  const report = async () => {
+    const finished = await Promise.all(results.map(result => finish(api, result)));
+    finished.forEach((result, i) => options.onProgress?.(i + 1, finished.length, result));
+    return finished;
+  };
+  const failAll = (status: string, error: string) => {
+    results.forEach(result => Object.assign(result, { status, error }));
+    return report();
+  };
+
+  // A query listed in more than one spec is only sent once; each of its rows reads the same result
+  const iris = [...new Set(queries.map(query => query.iri))];
+  const argument = queryArguments(options);
+  let jobId: number;
+  try {
+    const added = await api.addJob({ jobName: `[report] ${iris.length} queries`, queryRequests: iris.map(iri => ({ query: { iri }, argument })) });
+    if (!added?.jobId) return failAll("SUBMIT_FAILED", "Job add returned no jobId (check the RabbitMQ connection)");
+    jobId = added.jobId;
+  } catch (err) {
+    return failAll("SUBMIT_FAILED", errorText(err));
+  }
+  results.forEach(result => (result.jobId = jobId));
+
+  const { job, status: jobStatus, queuedMs } = await waitForJob(api, jobId, started, timeout);
+
+  let summaries: QueryResultSummary[] = [];
+  let summaryError: string | undefined;
+  try {
+    summaries = await api.getSummaries(jobId);
+  } catch (err) {
+    summaryError = `Could not load result summary: ${errorText(err)}`;
+  }
+  const subQueriesOf = subQueryLookup(summaries);
+  const ownSummary = (iri: string) => summaries.find(s => s.queryIri === iri && !summaries.some(parent => subQueriesOf(parent).includes(s)));
+  const anyErrored = results.some(result => (ownSummary(result.iri) ?? summaries.find(s => s.queryIri === result.iri))?.status === "ERRORED");
+
+  for (const result of results) {
+    const summary = ownSummary(result.iri) ?? summaries.find(s => s.queryIri === result.iri);
+    result.queuedMs = queuedMs;
+    result.dependencies = dependencyGraph(summaries, result.iri);
+    if (summaryError) result.error = summaryError;
+    if (summary) {
+      result.name = summary.queryName || result.name;
+      const [start, end] = [time(summary.startTime), time(summary.endTime)];
+      if (start !== undefined && end !== undefined) result.durationMs = Math.max(end - start, 0);
+    }
+
+    // A query still open when the job ended was left behind by its failure, or by the timeout
+    const ownStatus = summary && TERMINAL_STATUSES.includes(summary.status) ? summary.status : undefined;
+    result.status = ownStatus ?? jobStatus;
+
+    if (result.status === "COMPLETED") {
+      // An indicator's own result has no count, so it is read from its sub queries' results
+      const counted = summary && (summary.totalCount !== null ? summary : subQueriesOf(summary).find(s => s.totalCount !== null));
+      result.count = counted?.totalCount ?? null;
+      if (result.expectedCount !== "" && String(result.count) !== result.expectedCount) result.status = "COUNT_MISMATCH";
+    } else if (result.status === "ERRORED" || (jobStatus === "ERRORED" && !anyErrored)) {
+      Object.assign(result, jobErrorFields(job));
+    } else if (result.status === "CANCELLED" && jobStatus === "ERRORED") {
+      result.error = "Cancelled when another query in the job errored";
+    } else if (result.status === "TIMEOUT") {
+      result.error = `Job still "${job?.status}" after ${timeout}ms`;
+    }
+  }
+  return report();
 }
 
 /** Anything that did not pass also gets the query definition, to see what was run. */
@@ -231,6 +344,13 @@ async function finish(api: QueryReportApi, result: QueryReportResult): Promise<Q
 }
 
 export async function runQueries(api: QueryReportApi, queries: SpecQuery[], options: RunOptions): Promise<QueryReportResult[]> {
+  if (options.singleJob && queries.length) {
+    try {
+      return await runAsSingleJob(api, queries, options);
+    } catch (err: any) {
+      return queries.map(query => ({ ...blankResult(query), status: "SCRIPT_ERROR", error: String(err?.stack || err) }));
+    }
+  }
   const results: QueryReportResult[] = new Array(queries.length);
   let next = 0;
   let done = 0;
@@ -241,7 +361,7 @@ export async function runQueries(api: QueryReportApi, queries: SpecQuery[], opti
       const index = next++;
       const query = queries[index]!;
       try {
-        results[index] = await runQuery(api, query, options.timeout, options.searchDate);
+        results[index] = await runQuery(api, query, options);
       } catch (err: any) {
         results[index] = {
           ...query,
@@ -280,7 +400,15 @@ const EXPANDER = '<button type="button" class="expander" aria-expanded="false" a
 
 const escape = (value: unknown) => String(value ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
 
-export function htmlReport(results: QueryReportResult[], run: { baseUrl: string; startedAt: string; durationMs: number }): string {
+export function htmlReport(
+  results: QueryReportResult[],
+  run: { baseUrl: string; startedAt: string; durationMs: number } & Pick<RunOptions, "singleJob" | "searchDate" | "organisationIds">
+): string {
+  const settings = [
+    run.singleJob && "single job",
+    run.searchDate && `search date ${run.searchDate}`,
+    run.organisationIds?.length && `organisations ${run.organisationIds.join(", ")}`
+  ].filter(Boolean);
   const totals = results.reduce<Record<string, number>>((acc, r) => ({ ...acc, [r.status]: (acc[r.status] || 0) + 1 }), {});
   // Rows for dependencies are only built when expanded. "<" is escaped so a name cannot end the script element this is embedded in.
   const dependencies = JSON.stringify(
@@ -348,7 +476,9 @@ export function htmlReport(results: QueryReportResult[], run: { baseUrl: string;
   tr.dep td { background: #f9fafb; }
 </style></head><body>
 <h1>Query Report</h1>
-<p>${escape(run.baseUrl)} · ${escape(run.startedAt)} · took ${formatDuration(run.durationMs)} · ${results.length} queries · ${Object.entries(totals)
+<p>${escape(run.baseUrl)} · ${escape(run.startedAt)} · took ${formatDuration(run.durationMs)}${settings.map(setting => ` · ${escape(setting)}`).join("")} · ${results.length} queries · ${Object.entries(
+    totals
+  )
     .map(([status, n]) => `${escape(status)}: ${n}`)
     .join(" · ")}</p>
 <div class="filters"><strong>Status:</strong>

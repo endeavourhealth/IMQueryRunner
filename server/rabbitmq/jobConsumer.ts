@@ -10,10 +10,12 @@ import { isError } from "h3";
 import { indicatorResultTable, queryResultSetTable } from "../db/mysql/schema";
 import {
   closeOpenQueryResults,
+  failRequest,
   findJobById,
   getResultSetForJob,
   hasOpenResultSets,
   planJob,
+  recordJobError,
   updateJobStatus,
   updateWithEndTime,
   updateWithStartTime
@@ -53,6 +55,14 @@ export function getJobContext(jobId: number): ExecutionContext {
 
 export function releaseJobContext(jobId: number) {
   jobContexts.delete(jobId);
+}
+
+/**
+ * Whether a job carries on with its other requests after one of them fails. Only when running locally (`pnpm dev`), so every query of a
+ * job can be tried out in one go; anywhere else the job stops at the first failure.
+ */
+export function continuesAfterFailedRequest(): boolean {
+  return process.env.NODE_ENV === "development";
 }
 
 /** The worker calls IMAPI as this application (client credentials), not as the user who queued the job. */
@@ -107,6 +117,9 @@ export async function runPlannedRequest(accessToken: string, job: Job, planned: 
  *
  * The job's status spans its messages: the first one to run marks it RUNNING, the one that leaves no result set open marks it
  * COMPLETED, and a failure marks it ERRORED and cancels what has not run, so the job's remaining messages are skipped.
+ *
+ * In development (see `continuesAfterFailedRequest`) a failed request only fails itself: its error is kept on the job, the job's other
+ * requests still run, and the job is marked ERRORED rather than COMPLETED once the last of them has.
  */
 export async function handleJobMessage(msg: { body: unknown; messageId?: string }) {
   const body: any = typeof msg.body === "string" ? JSON.parse(msg.body) : msg.body;
@@ -142,13 +155,34 @@ export async function handleJobMessage(msg: { body: unknown; messageId?: string 
     const planned = message.success ? [message.data] : await planJob(job);
     if (message.success) LOG.debug(`Job ${job.id}: running request ${message.data.index + 1} of ${message.data.total}`);
 
+    const continueOnFailure = continuesAfterFailedRequest();
     for (const item of planned) {
-      await runPlannedRequest(accessToken, job, item, ctx);
+      if (!continueOnFailure) {
+        await runPlannedRequest(accessToken, job, item, ctx);
+        continue;
+      }
+      try {
+        await runPlannedRequest(accessToken, job, item, ctx);
+      } catch (err: unknown) {
+        LOG.error(
+          { err, messageId: msg.messageId, jobId },
+          `Job ${job.id}: request for ${item.queryRequest.query?.iri} failed. Carrying on with the job's other requests.`
+        );
+        await failRequest(job.id, item.queryResultSetId, item.queryRequest.query?.iri, item.indicatorResultId);
+        await recordJobError(job.id, err);
+      }
     }
 
     if (!(await hasOpenResultSets(job.id))) {
       releaseJobContext(job.id);
-      await updateJobStatus(job.id, JobStatus.COMPLETED, job.userId);
+      const failure = continueOnFailure ? (await findJobById(job.id))?.error : undefined;
+      if (failure) {
+        // Sub queries left waiting by a failed request that no later request needed never ran
+        await closeOpenQueryResults(job.id);
+        await updateJobStatus(job.id, JobStatus.ERRORED, job.userId, failure);
+      } else {
+        await updateJobStatus(job.id, JobStatus.COMPLETED, job.userId);
+      }
     }
   } catch (err: unknown) {
     LOG.error({ err, messageId: msg.messageId, jobId }, "Consumer failed for message");

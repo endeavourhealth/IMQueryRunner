@@ -150,6 +150,7 @@
       :queryType="comparisonTarget.queryType"
     />
     <ArgumentDisplayDialog :arguments="currentArguments" :show-footer-buttons="false" v-model:showDialog="showArgumentDisplay" />
+    <QueryReportDialog :suite="reportSuite" v-model:showDialog="showReportDialog" @run="options => reportSuite && runReport(reportSuite, options)" />
   </div>
 </template>
 
@@ -159,7 +160,9 @@ import type { QueryReportSuite } from "#shared/queryReport";
 import ActionButtons from "~/components/queryRunner/ActionButtons.vue";
 import ArgumentDisplayDialog from "~/components/queryRunner/ArgumentDisplayDialog.vue";
 import QueryComparisonDialog from "~/components/queryRunner/QueryComparisonDialog.vue";
+import QueryReportDialog from "~/components/queryRunner/QueryReportDialog.vue";
 import { runQueryReport } from "~/utils/queryReport";
+import type { QueryReportOptions } from "~/utils/queryReport";
 import { JobStatus } from "~~/enums";
 import type { Job, QueryResultSummary, QueueUpdate } from "~~/models";
 
@@ -203,9 +206,15 @@ const showArgumentDisplay = ref(false);
 const currentArguments: Ref<Argument[]> = ref([]);
 const reportMenu = ref();
 const reportProgress: Ref<{ done: number; total: number } | undefined> = ref();
+const reportSuite: Ref<QueryReportSuite | undefined> = ref();
+const showReportDialog = ref(false);
+// Each suite asks for its options (organisations, search date, single job) before it runs
 const reportMenuItems: MenuItem[] = (Object.keys(QUERY_REPORT_SUITES) as QueryReportSuite[]).map(suite => ({
   label: QUERY_REPORT_SUITES[suite].label,
-  command: () => runReport(suite)
+  command: () => {
+    reportSuite.value = suite;
+    showReportDialog.value = true;
+  }
 }));
 const adminView = false; //TODO: determine admin view based on user role and preference
 
@@ -558,11 +567,11 @@ function runQuery() {
 }
 
 /** Runs one of the gauge query suites as jobs, downloads the HTML report when they have all finished. */
-async function runReport(suite: QueryReportSuite) {
+async function runReport(suite: QueryReportSuite, options: QueryReportOptions) {
   const { label } = QUERY_REPORT_SUITES[suite];
   reportProgress.value = { done: 0, total: 0 };
   try {
-    const results = await runQueryReport(suite, (done, total) => (reportProgress.value = { done, total }));
+    const results = await runQueryReport(suite, options, (done, total) => (reportProgress.value = { done, total }));
     const failed = results.filter(r => r.status !== "COMPLETED").length;
     toast.add({
       severity: failed ? "warn" : "success",
