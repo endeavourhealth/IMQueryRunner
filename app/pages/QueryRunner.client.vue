@@ -119,6 +119,7 @@
                     class="p-button-rounded p-button-text p-button-plain"
                     @click="viewSummaryResults(node.data.job.id, node.data.summary)"
                     v-tooltip.left="'View results'"
+                    data-testid="view-query-results-button"
                   />
                   <Button
                     v-if="node.data.summary.queryType !== IMQType.INDICATOR && node.data.summary.status === JobStatus.COMPLETED"
