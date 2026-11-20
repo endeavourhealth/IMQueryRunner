@@ -5,9 +5,18 @@
         <div class="m-2">
           <Button icon="fa-solid fa-arrow-left" label="Back to queue" @click="backToQueue" />
         </div>
-        <div v-if="executedSql" class="m-2 min-w-0">
-          <Panel header="Executed SQL" :toggleable="true" :collapsed="!resultsError">
-            <SQLViewer :sql="executedSql" />
+        <div v-if="executedSql" ref="sqlPanel" class="m-2 min-w-0">
+          <Panel v-model:collapsed="sqlCollapsed" :toggleable="true">
+            <template #header>
+              <div class="flex items-center gap-2">
+                <span class="font-bold">Executed SQL</span>
+                <Tag v-if="highlightedCte" severity="warn" data-testid="query-results-highlighted-cte">
+                  <span>{{ highlightedCte }}</span>
+                  <i class="fa-solid fa-xmark ml-1 cursor-pointer" title="Clear highlight" @click.stop="highlightedCte = null" />
+                </Tag>
+              </div>
+            </template>
+            <SQLViewer ref="sqlViewer" :sql="executedSql" :highlight="highlightedCte" />
           </Panel>
         </div>
         <Message v-if="resultsError" class="m-2" severity="warn" :closable="false" data-testid="query-results-error">{{ resultsError }}</Message>
@@ -35,7 +44,19 @@
             </div>
           </template>
           <template #empty>None</template>
-          <Column v-for="col of columns" :key="col.field" :field="col.field" :header="col.header"></Column>
+          <Column v-for="col of columns" :key="col.field" :field="col.field" :header="col.header">
+            <template v-if="col.field === CTE_NAME_FIELD && executedSql" #body="{ data }">
+              <Button
+                :label="data[col.field]"
+                link
+                size="small"
+                class="p-0!"
+                :class="{ 'font-bold': data[col.field] === highlightedCte }"
+                title="Show in the executed SQL"
+                @click="showCteInSql(data[col.field])"
+              />
+            </template>
+          </Column>
         </DataTable>
       </div>
       <div class="im-dialog-footer">
@@ -57,7 +78,7 @@
 
 <script setup lang="ts">
 import type { Ref } from "vue";
-import { onMounted, ref } from "vue";
+import { nextTick, onMounted, ref, useTemplateRef } from "vue";
 
 import { isArrayHasLength } from "@endeavour/vue-library";
 import { useUserStore } from "@endeavour/vue-library/stores";
@@ -85,12 +106,20 @@ const totalCount = ref();
 const columns: Ref<any[]> = ref([]);
 const executedSql = ref<string | null>(null);
 const resultsError = ref<string | null>(null);
+const sqlCollapsed = ref(true);
+const highlightedCte = ref<string | null>(null);
+const sqlPanel = useTemplateRef<HTMLDivElement>("sqlPanel");
+const sqlViewer = useTemplateRef<InstanceType<typeof SQLViewer>>("sqlViewer");
+
+/** The debug results column naming the WITH (CTE) each row checked */
+const CTE_NAME_FIELD = "cteName";
 
 onMounted(async () => {
   // Independent: a query that failed has no results, but its SQL is what you came to see
   const [results, sql] = await Promise.allSettled([getQueryResults(), getExecutedSql()]);
   if (results.status === "rejected") resultsError.value = results.reason?.data?.message ?? "Could not load the results";
   if (sql.status === "rejected") console.warn("Could not load the executed SQL:", sql.reason);
+  sqlCollapsed.value = !resultsError.value;
   formatResultsForTable();
 });
 
@@ -133,6 +162,15 @@ async function onPage(event: any) {
   page.value = ++event.page;
   rows.value = event.rows;
   await getQueryResults();
+}
+
+async function showCteInSql(cteName: string) {
+  highlightedCte.value = cteName;
+  sqlCollapsed.value = false;
+  await nextTick();
+  sqlPanel.value?.scrollIntoView({ behavior: "smooth", block: "start" });
+  // Let the panel finish expanding before scrolling the definition into view
+  setTimeout(() => sqlViewer.value?.scrollToHighlight(), 300);
 }
 
 function backToQueue() {

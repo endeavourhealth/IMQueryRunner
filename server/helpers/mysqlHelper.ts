@@ -195,6 +195,19 @@ export async function getQueryResultIdForJob(jobId: number, queryIri: string): P
   return rows[0]?.id;
 }
 
+/**
+ * The position in `job.queryRequests` of the request a query result (the request's own or one of its sub queries') belongs to.
+ * planJob creates one result set per request, in request order, so the result's set is the request at the same position.
+ */
+export async function getQueryRequestIndexForResult(jobId: number, queryResultId: number): Promise<number | undefined> {
+  const [sets, results] = await Promise.all([
+    mysqlDb.select({ id: queryResultSetTable.id }).from(queryResultSetTable).where(eq(queryResultSetTable.jobId, jobId)).orderBy(asc(queryResultSetTable.id)),
+    mysqlDb.select({ queryResultSetId: queryResultTable.queryResultSetId }).from(queryResultTable).where(eq(queryResultTable.id, queryResultId))
+  ]);
+  const index = sets.findIndex(set => set.id === results[0]?.queryResultSetId);
+  return index === -1 ? undefined : index;
+}
+
 export async function getDebugResultsPaged(queryIri: string, patientId: string, page: number = 1, size: number = 25): Promise<PagedResults> {
   const whereClause = and(eq(patientExistsTable.queryIri, queryIri), eq(patientExistsTable.patientId, patientId));
   const [result, totalResult] = await Promise.all([
@@ -501,4 +514,12 @@ export function getToday() {
 
 export function getNow() {
   return new Date();
+}
+
+/** The distinct entity ids of a completed COHORT or DATASET result, as strings. */
+export async function getResultEntityIds(queryResultId: number, queryType: IMQType): Promise<string[]> {
+  const table = queryType === IMQType.COHORT ? cohortResultsTable : queryType === IMQType.DATASET ? datasetResultsTable : undefined;
+  if (!table) return [];
+  const rows = await mysqlDb.selectDistinct({ entityId: table.entityId }).from(table).where(eq(table.queryResultId, queryResultId));
+  return rows.map(r => String(r.entityId));
 }

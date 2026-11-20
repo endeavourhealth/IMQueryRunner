@@ -121,6 +121,14 @@
                     v-tooltip.left="'View results'"
                   />
                   <Button
+                    v-if="node.data.summary.queryType !== IMQType.INDICATOR && node.data.summary.status === JobStatus.COMPLETED"
+                    icon="fa-duotone fa-solid fa-diagram-venn"
+                    class="p-button-rounded p-button-text p-button-plain"
+                    @click="openComparison(node.data.job.id, node.data.summary)"
+                    v-tooltip.left="'Compare with CSV'"
+                    data-testid="compare-query-button"
+                  />
+                  <Button
                     v-if="node.data.summary.queryType !== IMQType.INDICATOR && node.data.summary.status === JobStatus.ERRORED"
                     icon="fa-duotone fa-solid fa-code"
                     class="p-button-rounded p-button-text p-button-plain"
@@ -134,6 +142,13 @@
         </transition>
       </div>
     </div>
+    <QueryComparisonDialog
+      v-if="comparisonTarget"
+      v-model:visible="showComparisonDialog"
+      :jobId="comparisonTarget.jobId"
+      :queryIri="comparisonTarget.queryIri"
+      :queryType="comparisonTarget.queryType"
+    />
     <ArgumentDisplayDialog :arguments="currentArguments" :show-footer-buttons="false" v-model:showDialog="showArgumentDisplay" />
     <QueryReportDialog :suite="reportSuite" v-model:showDialog="showReportDialog" @run="options => reportSuite && runReport(reportSuite, options)" />
   </div>
@@ -144,6 +159,7 @@ import { QUERY_REPORT_SUITES, subQueryLookup } from "#shared/queryReport";
 import type { QueryReportSuite } from "#shared/queryReport";
 import ActionButtons from "~/components/queryRunner/ActionButtons.vue";
 import ArgumentDisplayDialog from "~/components/queryRunner/ArgumentDisplayDialog.vue";
+import QueryComparisonDialog from "~/components/queryRunner/QueryComparisonDialog.vue";
 import QueryReportDialog from "~/components/queryRunner/QueryReportDialog.vue";
 import { runQueryReport } from "~/utils/queryReport";
 import type { QueryReportOptions } from "~/utils/queryReport";
@@ -531,6 +547,14 @@ async function viewQueryResults(queryItem: Job) {
 
 async function viewSummaryResults(jobId: number, summary: QueryResultSummary) {
   await navigateTo({ path: `/results/${jobId}/${summary.queryType}/${encodeURIComponent(summary.queryIri)}` });
+}
+
+const showComparisonDialog = ref(false);
+const comparisonTarget = ref<{ jobId: number; queryIri: string; queryType: string }>();
+
+function openComparison(jobId: number, summary: QueryResultSummary) {
+  comparisonTarget.value = { jobId, queryIri: summary.queryIri, queryType: summary.queryType };
+  showComparisonDialog.value = true;
 }
 
 async function viewArgumentDisplay(args: Argument[]) {
