@@ -20,7 +20,6 @@
           showIcon
           showButtonBar
           iconDisplay="input"
-          updateModelType="string"
           placeholder="Today"
           data-testid="report-search-date-input"
         />
@@ -54,12 +53,18 @@ const showDialog = defineModel<boolean>("showDialog");
 
 // Kept while the page is open, so running another suite starts from the last choices
 const organisationIds = ref<string | string[] | undefined>([]);
-const searchDate = ref<string | null>(null);
+const searchDate = ref<Date | null>(null);
 const singleJob = ref(false);
 
 function run() {
   const orgs = ([] as string[]).concat(organisationIds.value ?? []).filter(Boolean);
-  emit("run", { singleJob: singleJob.value, organisationIds: orgs.length ? orgs : undefined, searchDate: searchDate.value?.trim() || undefined });
+  emit("run", { singleJob: singleJob.value, organisationIds: orgs.length ? orgs : undefined, searchDate: formatDate(searchDate.value) });
   showDialog.value = false;
+}
+
+function formatDate(date: Date | null): string | undefined {
+  if (!date) return undefined;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 </script>
