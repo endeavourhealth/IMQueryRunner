@@ -269,23 +269,34 @@ export async function updateJobStatus(jobId: number, jobStatus: JobStatus, userI
       break;
     case JobStatus.ERRORED:
       set.finishDate = now;
-      set.error =
-        error instanceof Error
-          ? {
-              name: error.name,
-              message: error.message,
-              stack: error.stack,
-              cause: (error as any).cause ?? null
-            }
-          : typeof error === "string"
-            ? { message: error }
-            : (error as any);
+      set.error = serialiseJobError(error);
       break;
     default:
       throw new Error(`Invalid job status: ${jobStatus}`);
   }
   await mysqlDb.update(jobTable).set(set).where(eq(jobTable.id, jobId));
   emitQueueUpdate(userId, { jobId, status: jobStatus });
+}
+
+function serialiseJobError(error: any) {
+  return error instanceof Error
+    ? {
+        name: error.name,
+        message: error.message,
+        stack: error.stack,
+        cause: (error as any).cause ?? null
+      }
+    : typeof error === "string"
+      ? { message: error }
+      : error;
+}
+
+/** Keeps the error of a job that carries on after a failed request, so the job shows it once it ends. Only the first error is kept. */
+export async function recordJobError(jobId: number, error: unknown) {
+  await mysqlDb
+    .update(jobTable)
+    .set({ error: serialiseJobError(error) })
+    .where(and(eq(jobTable.id, jobId), isNull(jobTable.error)));
 }
 
 export async function createResultSetEntry(queryRequest: any, job: Job): Promise<QueryResultSet> {
@@ -414,11 +425,37 @@ export async function markQueryResultCompleted(id: number, queryResultSet: Query
   emitQueueUpdate(queryResultSet.userId, { jobId: queryResultSet.jobId });
 }
 
+async function getResultSetIdsForJob(jobId: number) {
+  return (await mysqlDb.select({ id: queryResultSetTable.id }).from(queryResultSetTable).where(eq(queryResultSetTable.jobId, jobId))).map(r => r.id);
+}
+
+/**
+ * After a request of a job has failed and the job carries on: what was running failed, and so did the request's own query if it never
+ * started. Its sub queries that never started stay queued, as a later request may still run them. Ends the request's result set.
+ */
+export async function failRequest(jobId: number, queryResultSetId: number, queryIri: string | undefined, indicatorResultId?: number | null) {
+  const resultSetIds = await getResultSetIdsForJob(jobId);
+  if (!resultSetIds.length) return;
+  const now = getNow();
+  await mysqlDb
+    .update(queryResultTable)
+    .set({ status: JobStatus.ERRORED, endTime: now })
+    .where(and(inArray(queryResultTable.queryResultSetId, resultSetIds), eq(queryResultTable.status, JobStatus.RUNNING)));
+  if (queryIri) {
+    await mysqlDb
+      .update(queryResultTable)
+      .set({ status: JobStatus.ERRORED, endTime: now })
+      .where(
+        and(eq(queryResultTable.queryResultSetId, queryResultSetId), eq(queryResultTable.queryIri, queryIri), eq(queryResultTable.status, JobStatus.QUEUED))
+      );
+  }
+  await updateWithEndTime(queryResultSetId, queryResultSetTable);
+  if (indicatorResultId) await updateWithEndTime(indicatorResultId, indicatorResultTable);
+}
+
 /** After a job has failed: what was running failed with it, what was still waiting never ran. */
 export async function closeOpenQueryResults(jobId: number) {
-  const resultSetIds = (await mysqlDb.select({ id: queryResultSetTable.id }).from(queryResultSetTable).where(eq(queryResultSetTable.jobId, jobId))).map(
-    r => r.id
-  );
+  const resultSetIds = await getResultSetIdsForJob(jobId);
   if (!resultSetIds.length) return;
   const inJob = inArray(queryResultTable.queryResultSetId, resultSetIds);
   await mysqlDb

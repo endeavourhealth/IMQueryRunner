@@ -5,7 +5,7 @@ import { hashQueryRequest } from "~~/server/utils/executeQuery";
 import { IMQType } from "@endeavour/vue-library/enums";
 
 import { MySqlDialect } from "drizzle-orm/mysql-core";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
  * An in-memory stand-in for the job's tables, so the real executeQuery runs against it: what one message runs is what a later
@@ -73,8 +73,9 @@ vi.mock("~~/server/helpers/mysqlHelper", () => {
       }),
     getResultSetForJob: async (id: number, job: any) => ({ ...store.resultSets.find(s => s.id === id && s.jobId === job.id)!, userId: job.userId }),
     hasOpenResultSets: async (jobId: number) => store.resultSets.some(s => s.jobId === jobId && !s.endTime),
-    updateJobStatus: async (id: number, status: string) => {
+    updateJobStatus: async (id: number, status: string, _userId: string, error: any = null) => {
       store.jobs.get(id).status = status;
+      if (status === "ERRORED") store.jobs.get(id).error = error;
       store.statuses.push(`${id} ${status}`);
     },
     closeOpenQueryResults: vi.fn(async (jobId: number) => {
@@ -83,6 +84,16 @@ vi.mock("~~/server/helpers/mysqlHelper", () => {
         if (r.status === "QUEUED") r.status = "CANCELLED";
       }
     }),
+    failRequest: async (jobId: number, resultSetId: number, iri: string) => {
+      for (const r of store.results.filter(r => r.jobId === jobId)) {
+        if (r.status === "RUNNING" || (r.resultSetId === resultSetId && r.iri === iri && r.status === "QUEUED")) r.status = "ERRORED";
+      }
+      store.resultSets.find(s => s.id === resultSetId)!.endTime = new Date();
+    },
+    recordJobError: async (jobId: number, err: Error) => {
+      const job = store.jobs.get(jobId);
+      job.error ??= { message: err.message };
+    },
     updateWithStartTime: async () => {},
     updateWithEndTime: async (id: number) => {
       const set = store.resultSets.find(s => s.id === id);
@@ -190,6 +201,47 @@ describe("handleJobMessage", () => {
     await handleJobMessage(messages[1]!);
     expect(store.executed).toEqual([]);
     expect(store.results.map(r => r.status)).toEqual([JobStatus.CANCELLED, JobStatus.CANCELLED]);
+  });
+
+  describe("in development", () => {
+    beforeEach(() => vi.stubEnv("NODE_ENV", "development"));
+    afterEach(() => vi.unstubAllEnvs());
+
+    it("carries on with the job's other requests after one fails, and marks the job errored once they have run", async () => {
+      const Q4 = "http://example.org/q4";
+      // Q4 does not use Q1
+      queryService.getSubqueryIris.mockImplementation(async () => []);
+      const { job, messages } = await queueJob(Q1, Q4);
+      queryService.getQuerySql.mockRejectedValueOnce(new Error("IMAPI down"));
+
+      await expect(handleJobMessage(messages[0]!)).resolves.toBeUndefined();
+      expect(job.status).toBe(JobStatus.RUNNING);
+
+      await handleJobMessage(messages[1]!);
+      expect(store.executed).toEqual(["SELECT from_q4"]);
+      expect(store.results.map(r => r.status)).toEqual([JobStatus.ERRORED, JobStatus.COMPLETED]);
+      expect(store.statuses).toEqual([`${job.id} RUNNING`, `${job.id} ERRORED`]);
+      expect((job as any).error).toEqual({ message: "IMAPI down" });
+    });
+
+    it("fails a later request that needs a sub query an earlier request failed to run", async () => {
+      const { job, messages } = await queueJob(Q1, Q2);
+      queryService.getQuerySql.mockRejectedValueOnce(new Error("IMAPI down"));
+
+      await runAll(messages);
+
+      expect(store.executed).toEqual([]);
+      expect(store.results.map(r => r.status)).toEqual([JobStatus.ERRORED, JobStatus.ERRORED]);
+      expect(job.status).toBe(JobStatus.ERRORED);
+    });
+
+    it("completes the job as usual when nothing fails", async () => {
+      const { job, messages } = await queueJob(Q1, Q2);
+
+      await runAll(messages);
+
+      expect(job.status).toBe(JobStatus.COMPLETED);
+    });
   });
 
   it("skips the remaining messages of a job cancelled between its requests and shows them as cancelled", async () => {

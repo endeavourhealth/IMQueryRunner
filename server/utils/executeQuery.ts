@@ -273,6 +273,9 @@ async function runSubQueries(
     const subQueryRequest = subQueryRequests[index]!;
     const hashCodeVersion = hashQueryRequest(subQueryRequest);
     const existing = await getQueryResultIfExistsInJob(queryResultSet.jobId, hashCodeVersion, subQueryRequest.query!.iri!);
+    // Only reached when a job carries on after a failed request: a result it left incomplete must not be used
+    if (existing && (existing.status === JobStatus.ERRORED || existing.status === JobStatus.CANCELLED))
+      throw new Error(`Sub query ${subQueryRequest.query!.iri} failed earlier in this job`);
     const resultId = existing?.id ?? (await createQueryResultEntry(subQueryRequest, queryResultSet, hashCodeVersion));
     resultIds[subQuery.iri!] = resultId;
     if (!existing || existing.status === JobStatus.QUEUED) waiting.add(resultId);

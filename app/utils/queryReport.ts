@@ -3,7 +3,7 @@
  * The running and the report itself are shared with `pnpm test:queries` (shared/queryReport.ts).
  */
 import { QUERY_REPORT_SUITES, fileStamp, htmlReport, readSpec, runQueries } from "#shared/queryReport";
-import type { QueryReportApi, QueryReportResult, QueryReportSuite } from "#shared/queryReport";
+import type { QueryReportApi, QueryReportResult, QueryReportSuite, RunOptions } from "#shared/queryReport";
 import type { Job, QueryResultSummary } from "~~/models";
 
 import type { Query } from "@endeavour/vue-library";
@@ -35,15 +35,22 @@ function download(fileName: string, content: string) {
   URL.revokeObjectURL(url);
 }
 
+/** What the user can choose for a report run; the rest of RunOptions is fixed here. */
+export type QueryReportOptions = Pick<RunOptions, "singleJob" | "organisationIds" | "searchDate">;
+
 /** Runs the suite's queries, downloads the HTML report and returns the results. */
-export async function runQueryReport(suite: QueryReportSuite, onProgress?: (done: number, total: number) => void): Promise<QueryReportResult[]> {
+export async function runQueryReport(
+  suite: QueryReportSuite,
+  options: QueryReportOptions = {},
+  onProgress?: (done: number, total: number) => void
+): Promise<QueryReportResult[]> {
   const queries = (await Promise.all(QUERY_REPORT_SUITES[suite].specs.map(async spec => readSpec(spec, await SPECS[spec]!())))).flat();
 
   const startTime = Date.now();
   const startedAt = new Date(startTime).toISOString();
-  const results = await runQueries(api, queries, { concurrency: CONCURRENCY, timeout: JOB_TIMEOUT, onProgress });
+  const results = await runQueries(api, queries, { ...options, concurrency: CONCURRENCY, timeout: JOB_TIMEOUT, onProgress });
 
-  const report = htmlReport(results, { baseUrl: window.location.origin, startedAt, durationMs: Date.now() - startTime });
+  const report = htmlReport(results, { ...options, baseUrl: window.location.origin, startedAt, durationMs: Date.now() - startTime });
   download(`query-report-${suite}-${fileStamp(startedAt)}.html`, report);
   return results;
 }
