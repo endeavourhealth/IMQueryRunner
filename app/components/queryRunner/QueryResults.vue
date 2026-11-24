@@ -174,7 +174,7 @@ async function showCteInSql(cteName: string) {
 }
 
 function backToQueue() {
-  navigateTo("/");
+  navigateTo("/QueryRunner");
 }
 
 async function getExecutedSql() {
