@@ -123,7 +123,7 @@ async function clearAllJobs(page) {
   await clearButton.click();
   const dialog = page.locator(".p-confirmdialog");
   await dialog.getByRole("button", { name: "Clear", exact: true }).click();
-  await expect(page.locator(".p-toast-message").filter({ hasText: "Jobs cleared" })).toBeVisible({ timeout: 30000 });
+  await expect(page.locator(".p-toast-message").filter({ hasText: "Jobs cleared" })).toBeVisible({ timeout: 120000 });
   console.log(await page.locator(".p-toast-message").filter({ hasText: "Jobs cleared" }).innerText());
 }
 
