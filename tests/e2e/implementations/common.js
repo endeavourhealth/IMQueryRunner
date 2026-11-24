@@ -3,6 +3,7 @@
 const { chromium, expect } = require("@playwright/test");
 const { pw } = require("./playwright");
 const path = require("path");
+const fs = require("fs");
 const assert = require("node:assert");
 require("dotenv").config();
 
@@ -75,8 +76,57 @@ afterScenario(async () => {
   await pw.browser.close();
 });
 
+// In a parallel run every stream runs the suite hooks, and the first to finish must not clear jobs another stream is still checking.
+// Each stream registers itself here while it runs; only the last one to finish clears the queue. Files left by dead processes are ignored
+const RUNNERS_DIR = path.join(__dirname, "..", "outputs", "runners");
+const CLEAR_LOCK = path.join(RUNNERS_DIR, "clear.lock");
+const runnerFile = () => path.join(RUNNERS_DIR, `runner-${process.pid}`);
+
+function isAlive(file) {
+  const pid = Number.parseInt(fs.readFileSync(file, "utf8"));
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+function removeIfDead(file) {
+  try {
+    if (!isAlive(file)) fs.rmSync(file, { force: true });
+  } catch (error) {
+    // Already removed by another stream
+  }
+}
+
+// True when no other stream is still running and this stream won the right to clear the queue
+function isLastRunner() {
+  fs.rmSync(runnerFile(), { force: true });
+  const others = fs.readdirSync(RUNNERS_DIR).filter(name => name.startsWith("runner-"));
+  others.forEach(name => removeIfDead(path.join(RUNNERS_DIR, name)));
+  if (fs.readdirSync(RUNNERS_DIR).some(name => name.startsWith("runner-"))) return false;
+  try {
+    fs.writeFileSync(CLEAR_LOCK, String(process.pid), { flag: "wx" });
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+beforeSuite(async context => {
+  if (!context.runnerId) return;
+  fs.mkdirSync(RUNNERS_DIR, { recursive: true });
+  if (fs.existsSync(CLEAR_LOCK)) removeIfDead(CLEAR_LOCK);
+  fs.writeFileSync(runnerFile(), String(process.pid));
+});
+
 // Once every spec has run, sign in as the test user in a fresh browser and clear the jobs the run left in the queue
-afterSuite(async () => {
+afterSuite(async context => {
+  if (context.runnerId && !isLastRunner()) {
+    console.log("Other streams are still running, leaving the queue for the last one to clear");
+    return;
+  }
   const browser = await chromium.launch({ headless: process.env.headless_chrome === "true" || false });
   try {
     const page = await (await browser.newContext()).newPage();
@@ -85,6 +135,7 @@ afterSuite(async () => {
     await clearAllJobs(page);
   } finally {
     await browser.close();
+    if (context.runnerId) fs.rmSync(CLEAR_LOCK, { force: true });
   }
 });
 
