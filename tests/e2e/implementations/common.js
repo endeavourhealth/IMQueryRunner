@@ -75,23 +75,64 @@ afterScenario(async () => {
   await pw.browser.close();
 });
 
+// Once every spec has run, sign in as the test user in a fresh browser and clear the jobs the run left in the queue
+afterSuite(async () => {
+  const browser = await chromium.launch({ headless: process.env.headless_chrome === "true" || false });
+  try {
+    const page = await (await browser.newContext()).newPage();
+    await page.goto(`${BASE_URL}/`);
+    await login(page);
+    await clearAllJobs(page);
+  } finally {
+    await browser.close();
+  }
+});
+
 step("Open IMQueryRunner", async () => {
   await pw.page.goto(`${BASE_URL}/`);
 });
 
-step("Login", async () => {
+async function login(page) {
   const username = process.env.TEST_USERNAME || "testuser";
   const password = process.env.TEST_PASSWORD || "testpass";
 
-  await pw.page.fill('input[placeholder="username, Email or phone"]', username);
-  await pw.page.fill('input[placeholder="Password"]', password);
-  await pw.page.click("button >> text=Sign In");
+  await page.fill('input[placeholder="username, Email or phone"]', username);
+  await page.fill('input[placeholder="Password"]', password);
+  await page.click("button >> text=Sign In");
 
   //dev login loop
-  //pw.page.locator("button").filter({ hasText: "cypress" }).click();
+  //page.locator("button").filter({ hasText: "cypress" }).click();
 
-  await pw.page.waitForSelector('[data-testid="accept-all-cookies"]', { state: "visible" });
-  await pw.page.click('[data-testid="accept-all-cookies"]');
+  await page.waitForSelector('[data-testid="accept-all-cookies"]', { state: "visible" });
+  await page.click('[data-testid="accept-all-cookies"]');
+}
+
+// Deletes every finished job of the test user through the queue page's "Clear all jobs" button (running jobs are kept by the app)
+async function clearAllJobs(page) {
+  await page.goto(`${BASE_URL}/QueryRunner`);
+  await expect(page.locator('[data-testid="job-table"]')).toBeVisible({ timeout: 30000 });
+  await expect(page.locator(".p-datatable-loading-icon")).toBeHidden({ timeout: 30000 });
+  const clearButton = page.locator('[data-testid="job-table-clear"]');
+  // The button stays disabled until the job list has loaded, so give it time to enable before deciding there is nothing to clear
+  try {
+    await expect(clearButton).toBeEnabled({ timeout: 15000 });
+  } catch (error) {
+    console.log("No jobs to clear");
+    return;
+  }
+  await clearButton.click();
+  const dialog = page.locator(".p-confirmdialog");
+  await dialog.getByRole("button", { name: "Clear", exact: true }).click();
+  await expect(page.locator(".p-toast-message").filter({ hasText: "Jobs cleared" })).toBeVisible({ timeout: 30000 });
+  console.log(await page.locator(".p-toast-message").filter({ hasText: "Jobs cleared" }).innerText());
+}
+
+step("Login", async () => {
+  await login(pw.page);
+});
+
+step("Clear all jobs", async () => {
+  await clearAllJobs(pw.page);
 });
 
 step("Goto route <route>", async route => {
