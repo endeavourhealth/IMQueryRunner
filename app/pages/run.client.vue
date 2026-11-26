@@ -2,32 +2,33 @@
   <div>
     <div class="flex gap-2 m-2">
       <div class="m-2">
-        <Button icon="fa-solid fa-arrow-left" label="Back to queue" severity="secondary" @click="backToQueue" />
+        <Button icon="fa-solid fa-arrow-left" label="Discard and exit" severity="secondary" @click="discardJob" />
       </div>
     </div>
-    <div class="m-6">
-      <div class="m-2">Find a query:</div>
-      <AutocompleteSearchBar
-        id="autocomplete-search"
-        v-model:selected="selected"
-        :im-query="request"
-        :root-entities="[IM.MODULE_QUERIES]"
-        placeholder="Search queries"
-      />
-    </div>
-    <div>
+    <Dialog v-model:visible="showAddDialog" header="Add to job" :closable="false" :style="{ width: '60rem' }" :breakpoints="{ '960px': '95vw' }" modal>
+      <div class="mb-4">
+        <div class="mb-2">Find a query:</div>
+        <AutocompleteSearchBar
+          id="autocomplete-search"
+          v-model:selected="selected"
+          :im-query="request"
+          :root-entities="[IM.MODULE_QUERIES]"
+          placeholder="Search queries"
+        />
+      </div>
       <ArgumentDisplay
         v-if="selected && args?.length"
         :arguments="args"
         :showFooterButtons="false"
         :editArguments="true"
-        @hide-dialog="showDialog = false"
+        @hide-dialog="cancelAdd"
         @arguments-completed="passArguments"
       />
-    </div>
-    <div class="mx-6 my-2">
-      <Button icon="fa-solid fa-plus" label="Add to queue" :disabled="selected === undefined || loading" @click="addToQueue" />
-    </div>
+      <template #footer>
+        <Button class="m-1" label="Cancel" variant="outlined" @click="cancelAdd" />
+        <Button class="m-1" label="Add" :disabled="selected === undefined || loading" @click="addToQueue" />
+      </template>
+    </Dialog>
     <DataTable v-if="queuedQueries.length" class="m-6" :value="queuedQueries">
       <template #empty>None</template>
       <Column header="Query">
@@ -39,8 +40,9 @@
         </template>
       </Column>
     </DataTable>
-    <div class="mx-6">
-      <Button icon="fa-solid fa-play" label="Run queue" :disabled="!queuedQueries.length" @click="showDialog = true" />
+    <div class="mx-6 my-2 flex gap-2">
+      <Button icon="fa-solid fa-plus" label="Add to job" @click="showAddDialog = true" />
+      <Button icon="fa-solid fa-play" label="Queue job" :disabled="!queuedQueries.length" @click="showDialog = true" />
     </div>
     <Dialog v-model:visible="showDialog" :closable="false" modal>
       Run <span class="font-bold">{{ jobName }}</span
@@ -48,6 +50,13 @@
       <template #footer>
         <Button class="m-1" label="Cancel" variant="outlined" @click="showDialog = false" autofocus />
         <Button class="m-1" label="Run" @click="runQueries" :disabled="disableRunButton" autofocus />
+      </template>
+    </Dialog>
+    <Dialog v-model:visible="showDiscardDialog" header="Discard job?" :closable="false" modal>
+      This job has {{ queuedQueries.length }} {{ queuedQueries.length === 1 ? "query" : "queries" }} that will be lost if you go back.
+      <template #footer>
+        <Button class="m-1" label="Keep editing" variant="outlined" @click="showDiscardDialog = false" autofocus />
+        <Button class="m-1" label="Discard" severity="danger" @click="confirmDiscard" />
       </template>
     </Dialog>
   </div>
@@ -110,6 +119,8 @@ const request: any = {
 };
 
 const showDialog = ref(false);
+const showAddDialog = ref(false);
+const showDiscardDialog = ref(false);
 const missingArgs = ref(true);
 const disableRunButton = ref(false);
 
@@ -148,13 +159,23 @@ function passArguments(args: Argument[], runOnConfirm: boolean) {
   missingArgs.value = !runOnConfirm;
 }
 
-function addToQueue() {
-  if (!selected.value) return;
-  queuedQueries.value.push({ selected: selected.value, argument: completedArguments.value });
+function resetSelection() {
   selected.value = undefined;
   args.value = [];
   completedArguments.value = [];
   missingArgs.value = true;
+}
+
+function addToQueue() {
+  if (!selected.value) return;
+  queuedQueries.value.push({ selected: selected.value, argument: completedArguments.value });
+  resetSelection();
+  showAddDialog.value = false;
+}
+
+function cancelAdd() {
+  resetSelection();
+  showAddDialog.value = false;
 }
 
 function removeFromQueue(index: number) {
@@ -201,6 +222,16 @@ async function getArguments() {
     { parameter: "$searchDate" } as ArgumentSelection
   ];
   missingArgs.value = !!args.value.length;
+}
+
+function discardJob() {
+  if (queuedQueries.value.length) showDiscardDialog.value = true;
+  else backToQueue();
+}
+
+function confirmDiscard() {
+  showDiscardDialog.value = false;
+  backToQueue();
 }
 
 function backToQueue() {

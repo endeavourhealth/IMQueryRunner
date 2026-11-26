@@ -7,7 +7,7 @@
             <Button class="flex" severity="secondary" icon="fa-solid fa-arrows-rotate" label="Refresh" @click="refresh" />
             <Select v-model="selectedInterval" :options="intervalList" optionLabel="name" placeholder="Refresh options"></Select>
           </div>
-          <Button class="flex" icon="fa-solid fa-magnifying-glass" label="Search and run" @click="runQuery" />
+          <Button class="flex" icon="fa-solid fa-magnifying-glass" label="Create job" @click="runQuery" />
           <Button
             class="flex"
             severity="secondary"
