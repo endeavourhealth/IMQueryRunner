@@ -81,7 +81,20 @@
                 <Tag v-else :severity="getStatusSeverity(node.data.summary.status)" :value="node.data.summary.status" />
               </template>
             </Column>
-            <Column>
+            <Column :pt="{ columnHeaderContent: { class: 'justify-end' } }">
+              <template #header>
+                <Button
+                  severity="danger"
+                  outlined
+                  size="small"
+                  icon="fa-solid fa-trash"
+                  label="Clear all jobs"
+                  :loading="clearing"
+                  :disabled="!jobs.length"
+                  @click="confirmClearAll"
+                  data-testid="job-table-clear"
+                />
+              </template>
               <template #body="{ node }: { node: QueueNode }">
                 <ActionButtons
                   v-if="node.data.kind === 'job'"
@@ -106,6 +119,15 @@
                     class="p-button-rounded p-button-text p-button-plain"
                     @click="viewSummaryResults(node.data.job.id, node.data.summary)"
                     v-tooltip.left="'View results'"
+                    data-testid="view-query-results-button"
+                  />
+                  <Button
+                    v-if="node.data.summary.queryType !== IMQType.INDICATOR && node.data.summary.status === JobStatus.COMPLETED"
+                    icon="fa-duotone fa-solid fa-diagram-venn"
+                    class="p-button-rounded p-button-text p-button-plain"
+                    @click="openComparison(node.data.job.id, node.data.summary)"
+                    v-tooltip.left="'Compare with CSV'"
+                    data-testid="compare-query-button"
                   />
                   <Button
                     v-if="node.data.summary.queryType !== IMQType.INDICATOR && node.data.summary.status === JobStatus.ERRORED"
@@ -121,7 +143,15 @@
         </transition>
       </div>
     </div>
+    <QueryComparisonDialog
+      v-if="comparisonTarget"
+      v-model:visible="showComparisonDialog"
+      :jobId="comparisonTarget.jobId"
+      :queryIri="comparisonTarget.queryIri"
+      :queryType="comparisonTarget.queryType"
+    />
     <ArgumentDisplayDialog :arguments="currentArguments" :show-footer-buttons="false" v-model:showDialog="showArgumentDisplay" />
+    <QueryReportDialog :suite="reportSuite" v-model:showDialog="showReportDialog" @run="options => reportSuite && runReport(reportSuite, options)" />
   </div>
 </template>
 
@@ -130,7 +160,10 @@ import { QUERY_REPORT_SUITES, subQueryLookup } from "#shared/queryReport";
 import type { QueryReportSuite } from "#shared/queryReport";
 import ActionButtons from "~/components/queryRunner/ActionButtons.vue";
 import ArgumentDisplayDialog from "~/components/queryRunner/ArgumentDisplayDialog.vue";
+import QueryComparisonDialog from "~/components/queryRunner/QueryComparisonDialog.vue";
+import QueryReportDialog from "~/components/queryRunner/QueryReportDialog.vue";
 import { runQueryReport } from "~/utils/queryReport";
+import type { QueryReportOptions } from "~/utils/queryReport";
 import { JobStatus } from "~~/enums";
 import type { Job, QueryResultSummary, QueueUpdate } from "~~/models";
 
@@ -174,9 +207,15 @@ const showArgumentDisplay = ref(false);
 const currentArguments: Ref<Argument[]> = ref([]);
 const reportMenu = ref();
 const reportProgress: Ref<{ done: number; total: number } | undefined> = ref();
+const reportSuite: Ref<QueryReportSuite | undefined> = ref();
+const showReportDialog = ref(false);
+// Each suite asks for its options (organisations, search date, single job) before it runs
 const reportMenuItems: MenuItem[] = (Object.keys(QUERY_REPORT_SUITES) as QueryReportSuite[]).map(suite => ({
   label: QUERY_REPORT_SUITES[suite].label,
-  command: () => runReport(suite)
+  command: () => {
+    reportSuite.value = suite;
+    showReportDialog.value = true;
+  }
 }));
 const adminView = false; //TODO: determine admin view based on user role and preference
 
@@ -511,6 +550,14 @@ async function viewSummaryResults(jobId: number, summary: QueryResultSummary) {
   await navigateTo({ path: `/results/${jobId}/${summary.queryType}/${encodeURIComponent(summary.queryIri)}` });
 }
 
+const showComparisonDialog = ref(false);
+const comparisonTarget = ref<{ jobId: number; queryIri: string; queryType: string }>();
+
+function openComparison(jobId: number, summary: QueryResultSummary) {
+  comparisonTarget.value = { jobId, queryIri: summary.queryIri, queryType: summary.queryType };
+  showComparisonDialog.value = true;
+}
+
 async function viewArgumentDisplay(args: Argument[]) {
   currentArguments.value = args;
   showArgumentDisplay.value = true;
@@ -521,11 +568,11 @@ function runQuery() {
 }
 
 /** Runs one of the gauge query suites as jobs, downloads the HTML report when they have all finished. */
-async function runReport(suite: QueryReportSuite) {
+async function runReport(suite: QueryReportSuite, options: QueryReportOptions) {
   const { label } = QUERY_REPORT_SUITES[suite];
   reportProgress.value = { done: 0, total: 0 };
   try {
-    const results = await runQueryReport(suite, (done, total) => (reportProgress.value = { done, total }));
+    const results = await runQueryReport(suite, options, (done, total) => (reportProgress.value = { done, total }));
     const failed = results.filter(r => r.status !== "COMPLETED").length;
     toast.add({
       severity: failed ? "warn" : "success",
@@ -547,6 +594,39 @@ async function deleteJob(jobId: string) {
     method: "delete"
   });
   await refresh();
+}
+
+const clearing = ref(false);
+
+function confirmClearAll() {
+  confirm.require({
+    message: "Delete all your jobs and their results? Running jobs are kept. This cannot be undone.",
+    header: "Clear all jobs",
+    icon: "fa-solid fa-triangle-exclamation",
+    acceptProps: { label: "Clear", severity: "danger" },
+    rejectProps: { label: "Cancel", severity: "secondary", outlined: true },
+    accept: clearAllJobs
+  });
+}
+
+async function clearAllJobs() {
+  clearing.value = true;
+  try {
+    const { deleted, skipped } = await $fetch<{ deleted: number; skipped: number }>("/api/queue", { method: "delete" });
+    toast.add({
+      severity: "success",
+      summary: "Jobs cleared",
+      detail: `${deleted} deleted${skipped ? `, ${skipped} running job(s) kept` : ""}`,
+      life: 5000
+    });
+    page.value = 1;
+  } catch (error) {
+    console.error("Clearing jobs failed:", error);
+    toast.add({ severity: "error", summary: "Could not clear jobs", detail: String(error), life: 10000 });
+  } finally {
+    clearing.value = false;
+    await refresh();
+  }
 }
 
 async function requeueJob(jobId: string) {

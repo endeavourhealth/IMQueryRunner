@@ -37,13 +37,15 @@ async function terminalJobRow() {
 
 async function openResults() {
   const { row } = await terminalJobRow();
-  // A queue refresh can re-render the row and destroy the popup mid-click, so reopen the menu and retry the whole sequence
+  // Results are opened from the job's query rows, which only render once the job row is expanded; the job's query is the first row under it
+  const queryRow = row.locator("xpath=following-sibling::tr[1]");
+  // A queue refresh can re-render the rows mid-click, so retry the whole sequence
   await expect(async () => {
-    await row.locator('[data-testid="view-query-results-button"]').click({ timeout: 5000 });
-    await pw.page.waitForSelector("#view-results-menu", { timeout: 5000 });
-    const menuItem = pw.page.locator(".p-menu-item").nth(0);
-    await menuItem.waitFor({ state: "visible", timeout: 5000 });
-    await menuItem.click({ timeout: 5000 });
+    if ((await row.getAttribute("aria-expanded")) !== "true") {
+      await row.locator(".p-treetable-node-toggle-button").click({ timeout: 5000 });
+    }
+    await queryRow.locator('[data-testid="view-query-results-button"]').click({ timeout: 5000 });
+    await pw.page.waitForURL(/\/results\//, { timeout: 5000 });
   }).toPass({ timeout: 25000 });
 }
 

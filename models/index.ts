@@ -6,3 +6,7 @@ export type { QueryResultSet } from "./queryResultSet.schema";
 export type { QueryResultSummary } from "./QueryResultSummary.schema.ts";
 export type { QueueUpdate } from "./QueueUpdate";
 export type { UserPreferences } from "./userPreferences.schema";
+export type { JobQueueMessage, PlannedQueryRequest } from "./jobQueueMessage.schema";
+export type { ComparisonPatient } from "./comparison.schema";
+export type { ComparisonContext } from "./comparisonContext.schema";
+export type { PatientInclusionNode, PatientInclusionRequest } from "./patientInclusion.schema";

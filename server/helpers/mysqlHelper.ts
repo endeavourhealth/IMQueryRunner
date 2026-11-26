@@ -4,6 +4,7 @@ import { ErrorCode, JobStatus } from "~~/enums";
 import { type JobRequest } from "~~/models/JobRequest";
 import { type IndicatorResult } from "~~/models/indicatorResult.schema";
 import { type Job } from "~~/models/job.schema";
+import { type PlannedQueryRequest } from "~~/models/jobQueueMessage.schema";
 import { type QueryResult } from "~~/models/queryResult.schema";
 import { type QueryResultSet } from "~~/models/queryResultSet.schema";
 
@@ -26,7 +27,7 @@ import {
   queryResultTable
 } from "../db/mysql/schema";
 import QueryService from "../services/QueryService";
-import { resolveArgs, sortQueryRequestsByDependency } from "../utils/executeQuery";
+import { hashQueryRequest, resolveArgs, sortQueryRequestsByDependency } from "../utils/executeQuery";
 import { TtlCache } from "../utils/memoryCache";
 
 const LOG = Logger("server/helpers/mysqlHelper");
@@ -60,9 +61,14 @@ export async function createJobEntry(jobRequest: JobRequest, accessToken: string
   return queryJob;
 }
 
-export async function getJobById(jobId: number): Promise<Job> {
+/** The job, or undefined when there is none (e.g. it was deleted while its messages were still queued). For the queue consumer. */
+export async function findJobById(jobId: number): Promise<Job | undefined> {
   const jobs = await mysqlDb.select().from(jobTable).where(eq(jobTable.id, jobId));
-  const job = jobs[0];
+  return jobs[0];
+}
+
+export async function getJobById(jobId: number): Promise<Job> {
+  const job = await findJobById(jobId);
   if (!job) {
     throw createError({ status: 400, statusText: ErrorCode.MissingDataError, message: "Queue job not found" });
   }
@@ -145,6 +151,26 @@ export async function deleteJobData(job: Job) {
   });
 }
 
+/**
+ * Deletes every job owned by `userId`, with everything each one produced. RUNNING jobs are left alone (the worker is still writing to them)
+ * and reported as skipped. Jobs are deleted one at a time, so a failure part-way leaves the rest intact and the call can simply be retried.
+ */
+export async function deleteAllJobsForUser(userId: string): Promise<{ deleted: number; skipped: number }> {
+  const jobs = await mysqlDb.select().from(jobTable).where(eq(jobTable.userId, userId));
+  let deleted = 0;
+  let skipped = 0;
+  for (const job of jobs) {
+    if (job.status === JobStatus.RUNNING) {
+      skipped++;
+      continue;
+    }
+    await deleteJobData(job);
+    deleted++;
+  }
+  if (deleted) emitQueueUpdate(userId);
+  return { deleted, skipped };
+}
+
 /** Row counts of completed results. Keyed by result id only, so callers must check job ownership before asking for a page. */
 const resultCountCache = new TtlCache<number>(10 * 60 * 1000, 1000);
 
@@ -167,6 +193,19 @@ export async function getQueryResultIdForJob(jobId: number, queryIri: string): P
     .orderBy(asc(queryResultSetTable.id), asc(queryResultTable.id))
     .limit(1);
   return rows[0]?.id;
+}
+
+/**
+ * The position in `job.queryRequests` of the request a query result (the request's own or one of its sub queries') belongs to.
+ * planJob creates one result set per request, in request order, so the result's set is the request at the same position.
+ */
+export async function getQueryRequestIndexForResult(jobId: number, queryResultId: number): Promise<number | undefined> {
+  const [sets, results] = await Promise.all([
+    mysqlDb.select({ id: queryResultSetTable.id }).from(queryResultSetTable).where(eq(queryResultSetTable.jobId, jobId)).orderBy(asc(queryResultSetTable.id)),
+    mysqlDb.select({ queryResultSetId: queryResultTable.queryResultSetId }).from(queryResultTable).where(eq(queryResultTable.id, queryResultId))
+  ]);
+  const index = sets.findIndex(set => set.id === results[0]?.queryResultSetId);
+  return index === -1 ? undefined : index;
 }
 
 export async function getDebugResultsPaged(queryIri: string, patientId: string, page: number = 1, size: number = 25): Promise<PagedResults> {
@@ -243,23 +282,34 @@ export async function updateJobStatus(jobId: number, jobStatus: JobStatus, userI
       break;
     case JobStatus.ERRORED:
       set.finishDate = now;
-      set.error =
-        error instanceof Error
-          ? {
-              name: error.name,
-              message: error.message,
-              stack: error.stack,
-              cause: (error as any).cause ?? null
-            }
-          : typeof error === "string"
-            ? { message: error }
-            : (error as any);
+      set.error = serialiseJobError(error);
       break;
     default:
       throw new Error(`Invalid job status: ${jobStatus}`);
   }
   await mysqlDb.update(jobTable).set(set).where(eq(jobTable.id, jobId));
   emitQueueUpdate(userId, { jobId, status: jobStatus });
+}
+
+function serialiseJobError(error: any) {
+  return error instanceof Error
+    ? {
+        name: error.name,
+        message: error.message,
+        stack: error.stack,
+        cause: (error as any).cause ?? null
+      }
+    : typeof error === "string"
+      ? { message: error }
+      : error;
+}
+
+/** Keeps the error of a job that carries on after a failed request, so the job shows it once it ends. Only the first error is kept. */
+export async function recordJobError(jobId: number, error: unknown) {
+  await mysqlDb
+    .update(jobTable)
+    .set({ error: serialiseJobError(error) })
+    .where(and(eq(jobTable.id, jobId), isNull(jobTable.error)));
 }
 
 export async function createResultSetEntry(queryRequest: any, job: Job): Promise<QueryResultSet> {
@@ -280,6 +330,47 @@ export async function createResultSetEntry(queryRequest: any, job: Job): Promise
   queryResultSet.id = queryResultSetId!;
   LOG.debug(`Inserted query result set ${queryResultSet.id} for job ${job.id}`);
   return queryResultSet;
+}
+
+/**
+ * Creates every request's result set and result (or indicator result) before any of them runs, so the whole job shows from the start, a
+ * request that never gets to run still has a status, and each request can find the results of the job's other requests whatever order
+ * they run in. Done once per job, before its requests are sent to the queue one message each.
+ */
+export async function planJob(job: Job): Promise<PlannedQueryRequest[]> {
+  const planned: PlannedQueryRequest[] = [];
+  for (const queryRequest of job.queryRequests) {
+    const queryResultSet = await createResultSetEntry(queryRequest, job);
+    const hashCodeVersion = hashQueryRequest(queryRequest);
+    let indicatorResultId: number | null = null;
+    if (queryRequest.query?.queryType === IMQType.INDICATOR) {
+      indicatorResultId = await createIndicatorResultEntry(queryRequest, queryResultSet, hashCodeVersion);
+    } else {
+      await createQueryResultEntry(queryRequest, queryResultSet, hashCodeVersion);
+    }
+    planned.push({ queryRequest, queryResultSetId: queryResultSet.id!, indicatorResultId });
+  }
+  return planned;
+}
+
+/** A result set of the job, in the shape the runner works with. Fails if it does not belong to the job. */
+export async function getResultSetForJob(queryResultSetId: number, job: Job): Promise<QueryResultSet> {
+  const rows = await mysqlDb
+    .select()
+    .from(queryResultSetTable)
+    .where(and(eq(queryResultSetTable.id, queryResultSetId), eq(queryResultSetTable.jobId, job.id)));
+  const row = rows[0];
+  if (!row) throw new Error(`Query result set ${queryResultSetId} not found for job ${job.id}`);
+  return { ...row, userId: job.userId } as QueryResultSet;
+}
+
+/** Whether any of the job's result sets has not finished yet. A job is complete once none has. */
+export async function hasOpenResultSets(jobId: number): Promise<boolean> {
+  const rows = await mysqlDb
+    .select({ total: count() })
+    .from(queryResultSetTable)
+    .where(and(eq(queryResultSetTable.jobId, jobId), isNull(queryResultSetTable.endTime)));
+  return (rows[0]?.total ?? 0) > 0;
 }
 
 export async function createQueryResultEntry(queryRequest: QueryRequest, queryResultSet: QueryResultSet, hashCodeVersion: number, indicatorId?: number) {
@@ -347,11 +438,37 @@ export async function markQueryResultCompleted(id: number, queryResultSet: Query
   emitQueueUpdate(queryResultSet.userId, { jobId: queryResultSet.jobId });
 }
 
+async function getResultSetIdsForJob(jobId: number) {
+  return (await mysqlDb.select({ id: queryResultSetTable.id }).from(queryResultSetTable).where(eq(queryResultSetTable.jobId, jobId))).map(r => r.id);
+}
+
+/**
+ * After a request of a job has failed and the job carries on: what was running failed, and so did the request's own query if it never
+ * started. Its sub queries that never started stay queued, as a later request may still run them. Ends the request's result set.
+ */
+export async function failRequest(jobId: number, queryResultSetId: number, queryIri: string | undefined, indicatorResultId?: number | null) {
+  const resultSetIds = await getResultSetIdsForJob(jobId);
+  if (!resultSetIds.length) return;
+  const now = getNow();
+  await mysqlDb
+    .update(queryResultTable)
+    .set({ status: JobStatus.ERRORED, endTime: now })
+    .where(and(inArray(queryResultTable.queryResultSetId, resultSetIds), eq(queryResultTable.status, JobStatus.RUNNING)));
+  if (queryIri) {
+    await mysqlDb
+      .update(queryResultTable)
+      .set({ status: JobStatus.ERRORED, endTime: now })
+      .where(
+        and(eq(queryResultTable.queryResultSetId, queryResultSetId), eq(queryResultTable.queryIri, queryIri), eq(queryResultTable.status, JobStatus.QUEUED))
+      );
+  }
+  await updateWithEndTime(queryResultSetId, queryResultSetTable);
+  if (indicatorResultId) await updateWithEndTime(indicatorResultId, indicatorResultTable);
+}
+
 /** After a job has failed: what was running failed with it, what was still waiting never ran. */
 export async function closeOpenQueryResults(jobId: number) {
-  const resultSetIds = (await mysqlDb.select({ id: queryResultSetTable.id }).from(queryResultSetTable).where(eq(queryResultSetTable.jobId, jobId))).map(
-    r => r.id
-  );
+  const resultSetIds = await getResultSetIdsForJob(jobId);
   if (!resultSetIds.length) return;
   const inJob = inArray(queryResultTable.queryResultSetId, resultSetIds);
   await mysqlDb
@@ -397,4 +514,12 @@ export function getToday() {
 
 export function getNow() {
   return new Date();
+}
+
+/** The distinct entity ids of a completed COHORT or DATASET result, as strings. */
+export async function getResultEntityIds(queryResultId: number, queryType: IMQType): Promise<string[]> {
+  const table = queryType === IMQType.COHORT ? cohortResultsTable : queryType === IMQType.DATASET ? datasetResultsTable : undefined;
+  if (!table) return [];
+  const rows = await mysqlDb.selectDistinct({ entityId: table.entityId }).from(table).where(eq(table.queryResultId, queryResultId));
+  return rows.map(r => String(r.entityId));
 }

@@ -29,7 +29,7 @@ export interface JobSummaryResult {
   error?: unknown;
 }
 
-function createLookups(accessToken: string, userId: string) {
+export function createLookups(accessToken: string, userId: string) {
   const limit = createLimiter(IMAPI_CONCURRENCY);
 
   const entityName = (iri: string) =>
