@@ -225,26 +225,24 @@ step("Click dialog confirm", async () => {
   await pw.page.locator(".p-confirmdialog").locator(".p-confirmdialog-accept-button").click();
 });
 
-step("Search for <text> and select", async text => {
-  pw.screenshotLabel = text;
-  await pw.page.waitForSelector("#autocomplete-search", { state: "visible" });
-  await pw.page.locator("#autocomplete-search").nth(0).fill(text);
-  await pw.page.locator(".p-listbox-option").filter({ hasText: text }).click();
-  await expect(pw.page.locator(".results-container")).toBeHidden();
-  await expect(pw.page.locator(".p-datatable")).toBeVisible({ timeout: 30000 });
+async function searchAndSelect(search, select) {
+  pw.screenshotLabel = select;
+  const dialog = pw.page.locator(".p-dialog").filter({ has: pw.page.locator("#autocomplete-search") });
+  await expect(dialog).toBeVisible();
+  await dialog.locator("#autocomplete-search").nth(0).fill(search);
+  await pw.page.locator(".p-autocomplete-option").filter({ hasText: select }).click();
+  await expect(pw.page.locator(".p-autocomplete-overlay")).toBeHidden();
+  await expect(dialog.locator(".p-datatable")).toBeVisible({ timeout: 30000 });
   await setSearchDate();
-  await expect(pw.page.getByRole("button", { name: "Add to queue" })).toBeEnabled();
+  await expect(dialog.getByRole("button", { name: "Add", exact: true })).toBeEnabled();
+}
+
+step("Search for <text> and select", async text => {
+  await searchAndSelect(text, text);
 });
 
 step("Search for <search> and select <select>", async (search, select) => {
-  pw.screenshotLabel = select;
-  await pw.page.waitForSelector("#autocomplete-search", { state: "visible" });
-  await pw.page.locator("#autocomplete-search").nth(0).fill(search);
-  await pw.page.locator(".p-listbox-option").filter({ hasText: select }).click();
-  await expect(pw.page.locator(".results-container")).toBeHidden();
-  await expect(pw.page.locator(".p-datatable")).toBeVisible({ timeout: 30000 });
-  await setSearchDate();
-  await expect(pw.page.getByRole("button", { name: "Add to queue" })).toBeEnabled();
+  await searchAndSelect(search, select);
 });
 
 step("Wait <time> seconds", async time => {

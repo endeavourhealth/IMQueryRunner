@@ -2604,10 +2604,11 @@ instead of its name, for every IRI in the table below.
 
 * Open IMQueryRunner
 * Login
-* Click "Search and run" button
+* Click "Create job" button
+* Click "Add to job" button
 * Search for <iri> and select <label>
-* Click "Add to queue" button
-* Click "Run queue" button
+* Click "Add" button
+* Click "Queue job" button
 * Click "Run" button
 * Wait for job to complete
 * Click "Refresh" button
