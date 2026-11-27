@@ -28,7 +28,14 @@ const helper = vi.hoisted(() => ({
   markQueryResultRunning: vi.fn(),
   getToday: vi.fn(() => "2026-01-01"),
   updateWithEndTime: vi.fn(),
-  updateWithSQL: vi.fn()
+  updateWithSQL: vi.fn(),
+  findDailyCacheResult: vi.fn(),
+  getCacheSourceResults: vi.fn(),
+  getQueryDependencies: vi.fn(),
+  copyResultRows: vi.fn(),
+  createCopiedQueryResultEntry: vi.fn(),
+  markQueryResultCopied: vi.fn(),
+  discardCopiedQueryResult: vi.fn()
 }));
 const db = vi.hoisted(() => ({ execute: vi.fn() }));
 
@@ -225,6 +232,178 @@ describe("executeQuery per-job lookups", () => {
     await executeQuery("token", "SELECT 1", request("http://example.org/q1"), resultSet, ctx);
 
     expect(db.execute).toHaveBeenCalled();
+  });
+});
+
+describe("daily cache", () => {
+  const MAIN = "http://example.org/q1";
+  const cachingSet = { id: 1, jobId: 7, useStartOfDaySnapshot: 1, startOfDaySnapshot: 1 } as any;
+  const source = (id: number, iri: string, extra: object = {}) => ({
+    id,
+    queryIri: iri,
+    version: 1,
+    queryType: IMQType.COHORT,
+    executedSQL: `SQL ${id}`,
+    cachedFromQueryResultId: null,
+    ...extra
+  });
+
+  beforeEach(() => {
+    calls.existing.length = 0;
+    let nextId = 100;
+    for (const fn of Object.values(helper)) fn.mockReset();
+    helper.getToday.mockReturnValue("2026-01-01");
+    helper.createQueryResultEntry.mockImplementation(async () => nextId++);
+    helper.createCopiedQueryResultEntry.mockImplementation(async () => 500);
+    helper.findDailyCacheResult.mockResolvedValue(undefined);
+    helper.getCacheSourceResults.mockResolvedValue([]);
+    helper.getQueryDependencies.mockResolvedValue([]);
+    helper.copyResultRows.mockResolvedValue(3);
+    db.execute.mockReset().mockResolvedValue(undefined);
+    queryService.getSubqueryIris.mockReset().mockResolvedValue([{ iri: SUB_A, parentIris: [MAIN] }]);
+    queryService.getQueryRequestForSQL.mockReset().mockImplementation(async (_t: string, r: any) => request(r.query.iri));
+    queryService.getQuerySql.mockReset().mockImplementation(async (_t: string, r: any) => `SELECT '${r.query.iri}'`);
+  });
+
+  it("always runs a top-level query, even when it is cached, and never looks it up", async () => {
+    queryService.getSubqueryIris.mockResolvedValue([]);
+    helper.findDailyCacheResult.mockResolvedValue(source(900, MAIN));
+
+    await executeQuery("token", "SELECT 1", request(MAIN), cachingSet, createExecutionContext());
+
+    expect(helper.findDailyCacheResult).not.toHaveBeenCalled();
+    expect(db.execute).toHaveBeenCalledTimes(1);
+    expect(helper.markQueryResultCompleted).toHaveBeenCalledWith(100, cachingSet);
+  });
+
+  it("copies a cached sub query instead of running it, without asking IMAPI for its SQL", async () => {
+    // Result ids: main 100, subA 101
+    helper.findDailyCacheResult.mockResolvedValue(source(900, SUB_A));
+
+    await executeQuery("token", "SELECT 1", request(MAIN), cachingSet, createExecutionContext());
+
+    expect(helper.findDailyCacheResult).toHaveBeenCalledWith(SUB_A, hashQueryRequest(request(SUB_A)), "2026-01-01", 7);
+    expect(helper.copyResultRows).toHaveBeenCalledWith(900, 101, IMQType.COHORT);
+    expect(helper.markQueryResultCopied).toHaveBeenCalledWith(101, expect.objectContaining({ id: 900 }), cachingSet);
+    expect(queryService.getQuerySql).not.toHaveBeenCalled();
+    // Only the main query ran
+    expect(db.execute).toHaveBeenCalledTimes(1);
+    expect(helper.markQueryResultCompleted.mock.calls.map(call => call[0])).toEqual([100]);
+  });
+
+  it("runs a sub query that is not cached", async () => {
+    await executeQuery("token", "SELECT 1", request(MAIN), cachingSet, createExecutionContext());
+
+    expect(helper.findDailyCacheResult).toHaveBeenCalledTimes(1);
+    expect(helper.copyResultRows).not.toHaveBeenCalled();
+    expect(db.execute).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not look anything up when the job opted out", async () => {
+    await executeQuery("token", "SELECT 1", request(MAIN), { ...cachingSet, useStartOfDaySnapshot: 0 }, createExecutionContext());
+
+    expect(helper.findDailyCacheResult).not.toHaveBeenCalled();
+    expect(db.execute).toHaveBeenCalledTimes(2);
+  });
+
+  it("never uses the cache for a debug-patient run", async () => {
+    const debugRequest = { ...request(MAIN), argument: [...request(MAIN).argument, { parameter: "$debugPatientId", valueData: "p1" }] };
+    queryService.getQuerySqlDebug.mockResolvedValue("SELECT debug");
+
+    await executeQuery("token", "SELECT 1", debugRequest, cachingSet, createExecutionContext());
+
+    expect(helper.findDailyCacheResult).not.toHaveBeenCalled();
+  });
+
+  it("copies the cached sub query's tree and records its links", async () => {
+    // Source 900 (subA) used source 901 (subZ), which this job does not have yet
+    const SUB_Z = "http://example.org/subZ";
+    helper.findDailyCacheResult.mockResolvedValue(source(900, SUB_A));
+    helper.getQueryDependencies.mockImplementation(async (parents: number[]) =>
+      parents.includes(900) ? [{ parentQueryResultId: 900, subQueryResultId: 901 }] : []
+    );
+    helper.getCacheSourceResults.mockResolvedValue([source(901, SUB_Z, { version: 42, cachedFromQueryResultId: 800 })]);
+
+    await executeQuery("token", "SELECT 1", request(MAIN), cachingSet, createExecutionContext());
+
+    expect(helper.createCopiedQueryResultEntry).toHaveBeenCalledWith(expect.objectContaining({ id: 901 }), cachingSet);
+    // The sub result is copied before the result that used it
+    expect(helper.copyResultRows.mock.calls).toEqual([
+      [901, 500, IMQType.COHORT],
+      [900, 101, IMQType.COHORT]
+    ]);
+    expect(helper.createQueryDependencies).toHaveBeenLastCalledWith([{ parentQueryResultId: 101, subQueryResultId: 500 }]);
+    expect(db.execute).toHaveBeenCalledTimes(1);
+  });
+
+  it("reuses a result the job already completed instead of copying it", async () => {
+    const SUB_Z = "http://example.org/subZ";
+    helper.findDailyCacheResult.mockResolvedValue(source(900, SUB_A));
+    helper.getQueryDependencies.mockImplementation(async (parents: number[]) =>
+      parents.includes(900) ? [{ parentQueryResultId: 900, subQueryResultId: 901 }] : []
+    );
+    helper.getCacheSourceResults.mockResolvedValue([source(901, SUB_Z)]);
+    // main, subA in the job, then subZ is found already completed in the job
+    calls.existing.push([], [], [{ id: 77, status: JobStatus.COMPLETED }]);
+
+    await executeQuery("token", "SELECT 1", request(MAIN), cachingSet, createExecutionContext());
+
+    expect(helper.createCopiedQueryResultEntry).not.toHaveBeenCalled();
+    expect(helper.copyResultRows.mock.calls).toEqual([[900, 101, IMQType.COHORT]]);
+    expect(helper.createQueryDependencies).toHaveBeenLastCalledWith([{ parentQueryResultId: 101, subQueryResultId: 77 }]);
+  });
+
+  it("does not run a queued sub query again once a copy has completed it", async () => {
+    // subB is listed first and its cached tree holds subA, which this job has queued to run next
+    queryService.getSubqueryIris.mockResolvedValue([
+      { iri: SUB_B, parentIris: [MAIN] },
+      { iri: SUB_A, parentIris: [MAIN] }
+    ]);
+    helper.findDailyCacheResult.mockImplementation(async (iri: string) => (iri === SUB_B ? source(900, SUB_B) : undefined));
+    helper.getQueryDependencies.mockImplementation(async (parents: number[]) =>
+      parents.includes(900) ? [{ parentQueryResultId: 900, subQueryResultId: 901 }] : []
+    );
+    helper.getCacheSourceResults.mockResolvedValue([source(901, SUB_A)]);
+    // main, subB, subA in the job; then the copy finds subA queued (id 102)
+    calls.existing.push([], [], [], [{ id: 102, status: JobStatus.QUEUED }]);
+
+    await executeQuery("token", "SELECT 1", request(MAIN), cachingSet, createExecutionContext());
+
+    expect(helper.copyResultRows.mock.calls).toEqual([
+      [901, 102, IMQType.COHORT],
+      [900, 101, IMQType.COHORT]
+    ]);
+    expect(db.execute).toHaveBeenCalledTimes(1);
+    expect(helper.findDailyCacheResult).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to running the sub query when the copy fails, and undoes the partial copy", async () => {
+    helper.findDailyCacheResult.mockResolvedValue(source(900, SUB_A));
+    helper.copyResultRows.mockRejectedValue(new Error("lock wait timeout"));
+
+    await executeQuery("token", "SELECT 1", request(MAIN), cachingSet, createExecutionContext());
+
+    expect(helper.discardCopiedQueryResult).toHaveBeenCalledWith(101, IMQType.COHORT, false, JobStatus.RUNNING);
+    expect(db.execute).toHaveBeenCalledTimes(2);
+    expect(helper.markQueryResultCompleted.mock.calls.map(call => call[0])).toEqual([101, 100]);
+  });
+
+  it("falls back to running the sub query when the lookup fails", async () => {
+    helper.findDailyCacheResult.mockRejectedValue(new Error("db down"));
+
+    await executeQuery("token", "SELECT 1", request(MAIN), cachingSet, createExecutionContext());
+
+    expect(db.execute).toHaveBeenCalledTimes(2);
+  });
+
+  it("copies an indicator's sub query, which is a sub query of the indicator", async () => {
+    helper.findDailyCacheResult.mockResolvedValue(source(900, SUB_A));
+
+    await executeQuery("token", "SELECT 1", request(SUB_A), cachingSet, createExecutionContext(), true);
+
+    expect(helper.copyResultRows).toHaveBeenCalledWith(900, 100, IMQType.COHORT);
+    expect(queryService.getSubqueryIris).not.toHaveBeenCalled();
+    expect(db.execute).not.toHaveBeenCalled();
   });
 });
 

@@ -12,11 +12,19 @@ import murmurhash from "murmurhash";
 import { mysqlDb } from "../db/mysql";
 import { patientExistsTable, queryResultSetTable, queryResultTable } from "../db/mysql/schema";
 import {
+  type CacheSourceResult,
+  copyResultRows,
+  createCopiedQueryResultEntry,
   createQueryDependencies,
   createQueryResultEntry,
+  discardCopiedQueryResult,
+  findDailyCacheResult,
+  getCacheSourceResults,
+  getQueryDependencies as getStoredQueryDependencies,
   getToday,
   linkQueryResultsToIndicator,
   markQueryResultCompleted,
+  markQueryResultCopied,
   markQueryResultRunning,
   updateWithSQL
 } from "../helpers/mysqlHelper";
@@ -55,12 +63,17 @@ function memo<T>(cache: Map<string, Promise<T>>, key: string, load: () => Promis
   return promise;
 }
 
+/**
+ * Runs a query and its sub queries. `isSubQuery` is set for an indicator's sub queries: unlike a job's own (top-level) queries, which
+ * always run, a sub query can be taken from the daily cache. Sub queries reached through `runSubQueries` always can.
+ */
 export async function executeQuery(
   accessToken: string,
   sql: string,
   queryRequest: QueryRequest,
   queryResultSet: QueryResultSet,
-  ctx: ExecutionContext = createExecutionContext()
+  ctx: ExecutionContext = createExecutionContext(),
+  isSubQuery = false
 ) {
   if (!queryRequest.query?.iri) throw new Error("Query IRI is required for execution");
   const hashCodeVersion = hashQueryRequest(queryRequest);
@@ -69,6 +82,11 @@ export async function executeQuery(
 
   const queryResultId = existingQueryResult?.id ?? (await createQueryResultEntry(queryRequest, queryResultSet, hashCodeVersion));
   await markQueryResultRunning(queryResultId, queryResultSet);
+
+  if (isSubQuery && canUseDailyCache(queryRequest, queryResultSet)) {
+    const cached = await useDailyCache(queryResultId, queryRequest, hashCodeVersion, queryResultSet);
+    if (cached.hit) return;
+  }
 
   const debugPatientId = getDebugPatientId(queryRequest);
 
@@ -269,9 +287,10 @@ async function runSubQueries(
   // Every sub query gets its result and links before any of them runs, so a job that stops part way still shows the whole tree
   const resultIds = { ...queryIrisToHashCodes };
   const waiting = new Set<number>();
+  const hashCodeVersions = subQueryRequests.map(subQueryRequest => hashQueryRequest(subQueryRequest));
   for (const [index, subQuery] of subQueries.entries()) {
     const subQueryRequest = subQueryRequests[index]!;
-    const hashCodeVersion = hashQueryRequest(subQueryRequest);
+    const hashCodeVersion = hashCodeVersions[index]!;
     const existing = await getQueryResultIfExistsInJob(queryResultSet.jobId, hashCodeVersion, subQueryRequest.query!.iri!);
     // Only reached when a job carries on after a failed request: a result it left incomplete must not be used
     if (existing && (existing.status === JobStatus.ERRORED || existing.status === JobStatus.CANCELLED))
@@ -291,6 +310,13 @@ async function runSubQueries(
       if (!waiting.delete(resultId)) continue;
 
       await markQueryResultRunning(resultId, queryResultSet);
+      // The sub queries of a debug-patient run are part of that run, so they never come from the cache either
+      if (!getDebugPatientId(queryRequest) && canUseDailyCache(subQueryRequest, queryResultSet)) {
+        const cached = await useDailyCache(resultId, subQueryRequest, hashCodeVersions[index]!, queryResultSet);
+        // A copy also completes the sub results it brings with it, which must not then run as well
+        for (const id of cached.completed) waiting.delete(id);
+        if (cached.hit) continue;
+      }
       const subQuerySql = await getSubQuerySql(accessToken, subQueryRequest, ctx);
       const resolvedSql = getResolvedSql(subQuerySql, subQueryRequest, queryIrisToHashCodes);
       await executeCohortQuery(resolvedSql, subQueryRequest, resultId, queryResultSet);
@@ -299,6 +325,122 @@ async function runSubQueries(
       throw err;
     }
   }
+}
+
+/** Whether a sub query may be taken from the daily cache: the job asked for it, and it is not a debug-patient run */
+export function canUseDailyCache(queryRequest: QueryRequest, queryResultSet: QueryResultSet): boolean {
+  return !!queryResultSet.useStartOfDaySnapshot && !getDebugPatientId(queryRequest);
+}
+
+/**
+ * Completes the sub query result `targetId` (already RUNNING) by copying a matching daily-cache result from another job, along with the
+ * sub query tree under it, so every read path sees it as if it had run here (see docs/DAILY_CACHE.MD §5.6).
+ *
+ * `hit` is false on a miss, or when the copy failed: the caller then runs the query as normal. A failure never fails the job. `completed`
+ * lists the results of this job the copy completed, which can include some even when it failed: they must not be run again.
+ */
+export async function useDailyCache(
+  targetId: number,
+  queryRequest: QueryRequest,
+  hashCodeVersion: number,
+  queryResultSet: QueryResultSet
+): Promise<{ hit: boolean; completed: number[] }> {
+  const iri = queryRequest.query!.iri!;
+  const completed: number[] = [];
+  let source: CacheSourceResult | undefined;
+  try {
+    source = await findDailyCacheResult(iri, hashCodeVersion, getToday(), queryResultSet.jobId);
+  } catch (err) {
+    LOG.warn({ err, iri }, "Daily cache lookup failed. Running the query instead.");
+    return { hit: false, completed };
+  }
+  if (!source) {
+    LOG.debug(`Daily cache miss: ${iri}, hash: ${hashCodeVersion}`);
+    return { hit: false, completed };
+  }
+
+  // The result being copied when something fails, so its partial copy can be undone
+  let current: { id: number; queryType: IMQType; created: boolean; status: JobStatus.QUEUED | JobStatus.RUNNING } | undefined;
+  try {
+    const { order, edges } = await getCachedTree(source.id);
+    const subSources = new Map((await getCacheSourceResults(order.filter(id => id !== source!.id))).map(row => [row.id, row]));
+    const sourceToTarget = new Map<number, number>([[source.id, targetId]]);
+
+    // Sub results first, so a copy that stops part way only ever leaves complete results behind
+    for (const sourceId of order) {
+      if (sourceId === source.id) continue;
+      const subSource = subSources.get(sourceId);
+      if (!subSource) throw new Error(`Cached sub query result ${sourceId} no longer exists`);
+      const existing = await getQueryResultIfExistsInJob(queryResultSet.jobId, subSource.version, subSource.queryIri);
+      if (existing?.status === JobStatus.COMPLETED) {
+        sourceToTarget.set(sourceId, existing.id);
+        continue;
+      }
+      if (existing && existing.status !== JobStatus.QUEUED) throw new Error(`Sub query ${subSource.queryIri} is ${existing.status} in this job`);
+
+      if (existing) {
+        current = { id: existing.id, queryType: subSource.queryType, created: false, status: JobStatus.QUEUED };
+        await markQueryResultRunning(existing.id, queryResultSet);
+      } else {
+        const id = await createCopiedQueryResultEntry(subSource, queryResultSet);
+        current = { id, queryType: subSource.queryType, created: true, status: JobStatus.QUEUED };
+      }
+      await copyResultRows(sourceId, current.id, subSource.queryType);
+      await markQueryResultCopied(current.id, subSource, queryResultSet);
+      sourceToTarget.set(sourceId, current.id);
+      completed.push(current.id);
+      current = undefined;
+    }
+
+    current = { id: targetId, queryType: source.queryType, created: false, status: JobStatus.RUNNING };
+    const rows = await copyResultRows(source.id, targetId, source.queryType);
+    await createQueryDependencies(
+      edges.flatMap(edge => {
+        const parentQueryResultId = sourceToTarget.get(edge.parentQueryResultId);
+        const subQueryResultId = sourceToTarget.get(edge.subQueryResultId);
+        return parentQueryResultId === undefined || subQueryResultId === undefined ? [] : [{ parentQueryResultId, subQueryResultId }];
+      })
+    );
+    await markQueryResultCopied(targetId, source, queryResultSet);
+    completed.unshift(targetId);
+    LOG.info(`Daily cache hit: ${iri}, hash: ${hashCodeVersion}, source result ${source.id} → ${targetId} (${rows} rows)`);
+    return { hit: true, completed };
+  } catch (err) {
+    LOG.warn({ err, iri, sourceId: source.id, targetId }, "Daily cache copy failed. Running the query instead.");
+    if (current) {
+      try {
+        await discardCopiedQueryResult(current.id, current.queryType, current.created, current.status);
+      } catch (cleanupErr) {
+        LOG.error({ err: cleanupErr, queryResultId: current.id }, "Failed to undo a partial daily cache copy");
+      }
+    }
+    return { hit: false, completed };
+  }
+}
+
+/** Every result in the sub query tree of `rootId` as recorded in query_dependency, sub results before the results that use them, and its edges */
+async function getCachedTree(rootId: number) {
+  const edges: { parentQueryResultId: number; subQueryResultId: number }[] = [];
+  const seen = new Set([rootId]);
+  let frontier = [rootId];
+  while (frontier.length) {
+    const found = await getStoredQueryDependencies(frontier);
+    edges.push(...found);
+    frontier = [...new Set(found.map(edge => edge.subQueryResultId))].filter(id => !seen.has(id));
+    frontier.forEach(id => seen.add(id));
+  }
+
+  const subsByParent = Map.groupBy(edges, edge => edge.parentQueryResultId);
+  const order: number[] = [];
+  const visited = new Set<number>();
+  const visit = (id: number) => {
+    if (visited.has(id)) return;
+    visited.add(id);
+    for (const edge of subsByParent.get(id) ?? []) visit(edge.subQueryResultId);
+    order.push(id);
+  };
+  visit(rootId);
+  return { order, edges };
 }
 
 /** Parent and sub query result id pairs. Only once every sub query has a result id, as a parent can be listed after its sub query. */

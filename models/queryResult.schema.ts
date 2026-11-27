@@ -17,6 +17,8 @@ export const queryResultSchema = z.object({
   startOfDaySnapshot: z.number().int(),
   persistent: z.number().int(),
   useStartOfDaySnapshot: z.number().int(),
+  /** The result this one was copied from by the daily cache, always the original. Null when it was computed */
+  cachedFromQueryResultId: z.number().int().nullable().optional(),
   version: z.number().int(),
   queryType: z.enum(IMQType),
   status: z.enum(JobStatus)

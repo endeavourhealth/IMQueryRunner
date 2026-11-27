@@ -20,7 +20,9 @@ export const QueryResultSummarySchema = z.strictObject({
   endTime: z.date().nullable(),
   subQueryIris: z.array(z.url()).optional(),
   /** Result ids of the sub queries this result used directly, as recorded when the job ran */
-  subQueryResultIds: z.array(z.number()).optional()
+  subQueryResultIds: z.array(z.number()).optional(),
+  /** Copied from an earlier result of the daily cache rather than computed. Not set for an indicator */
+  fromDailyCache: z.boolean().optional()
 });
 
 export type QueryResultSummary = z.output<typeof QueryResultSummarySchema>;

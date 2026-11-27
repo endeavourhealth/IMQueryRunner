@@ -81,6 +81,7 @@ CREATE TABLE
         use_start_of_day_snapshot BIT (1),
         version BIGINT,
         executed_sql MEDIUMTEXT,
+        cached_from_query_result_id BIGINT NULL,
         FOREIGN KEY (query_result_set_id) REFERENCES query_result_set (id),
         FOREIGN KEY (indicator_result_id) REFERENCES indicator_result (id),
         query_type VARCHAR(255),
@@ -127,6 +128,7 @@ CREATE TABLE patient_exists (
 
 CREATE INDEX idx_job_user_queue_date ON dataset.job (user_id, queue_date);
 CREATE INDEX idx_query_result_set_iri ON dataset.query_result (query_result_set_id, query_iri);
+CREATE INDEX idx_query_result_daily_cache ON dataset.query_result (query_iri, version, start_of_day_snapshot, status, end_time);
 CREATE INDEX idx_patient_exists_iri_patient ON dataset.patient_exists (query_iri, patient_id);
 
 -- cohort_results and dataset_results carry a NON-unique idx_qr_entity (query_result_id, entity_id) (see CREATE TABLE above). It makes
@@ -166,6 +168,11 @@ CREATE INDEX idx_patient_exists_iri_patient ON dataset.patient_exists (query_iri
 --   SET qr.`status` = j.`status`
 --   WHERE qr.end_time IS NULL;
 -- ALTER TABLE dataset.query_result ALTER COLUMN `status` DROP DEFAULT;
+
+-- Daily cache (docs/DAILY_CACHE.MD). start_of_day_snapshot / use_start_of_day_snapshot already exist and now hold the cache flags.
+-- cached_from_query_result_id deliberately has no foreign key: deleting the source job must leave the copies intact.
+-- ALTER TABLE dataset.query_result ADD COLUMN cached_from_query_result_id BIGINT NULL;
+-- CREATE INDEX idx_query_result_daily_cache ON dataset.query_result (query_iri, version, start_of_day_snapshot, status, end_time);
 
 -- dataset.concept_tct is built outside this repository. These are the indexes in use on the live database, recorded so they are not lost:
 --   PRIMARY (dbid)
