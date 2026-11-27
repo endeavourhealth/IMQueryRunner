@@ -12,6 +12,8 @@ import { mysqlSchema } from "drizzle-orm/mysql-core";
 // (and the index() definitions) after running it.
 const dataset = mysqlSchema("dataset");
 
+// start_of_day_snapshot / use_start_of_day_snapshot hold the daily cache flags, sent in the API as saveAsDailyCache / useDailyCache
+// (see docs/DAILY_CACHE.MD). The columns keep their original names.
 export const jobTable = dataset.table(
   "job",
   {
@@ -73,11 +75,16 @@ export const queryResultTable = dataset.table(
     persistent: tinyint("persistent").notNull(),
     useStartOfDaySnapshot: tinyint("use_start_of_day_snapshot").notNull(),
     executedSQL: mediumtext("executed_sql"),
+    /** Set when the daily cache copied this result: the original it came from. No foreign key, so the source job can still be deleted */
+    cachedFromQueryResultId: int("cached_from_query_result_id"),
     version: int("version").notNull(),
     queryType: varchar("query_type", { length: 255 }).$type<IMQType>().notNull(),
     status: varchar("status", { length: 45 }).$type<JobStatus>().notNull()
   },
-  table => [index("idx_query_result_set_iri").on(table.queryResultSetId, table.queryIri)]
+  table => [
+    index("idx_query_result_set_iri").on(table.queryResultSetId, table.queryIri),
+    index("idx_query_result_daily_cache").on(table.queryIri, table.version, table.startOfDaySnapshot, table.status, table.endTime)
+  ]
 );
 
 export const queryDependencyTable = dataset.table(

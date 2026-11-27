@@ -103,8 +103,9 @@ export async function runPlannedRequest(accessToken: string, job: Job, planned: 
 
   LOG.debug(`Queries to run: ${queriesToRun.length}`);
 
+  // An indicator's queries are its sub queries, so they can come from the daily cache. Any other request is the job's own query and always runs.
   for (const item of queriesToRun) {
-    await executeQuery(accessToken, item.sql, item.queryRequest, queryResultSet, ctx);
+    await executeQuery(accessToken, item.sql, item.queryRequest, queryResultSet, ctx, !!indicatorResultId);
   }
 
   await updateWithEndTime(queryResultSet.id!, queryResultSetTable);

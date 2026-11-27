@@ -12,7 +12,7 @@ import { isArrayHasLength } from "@endeavour/vue-library";
 import { IMQType } from "@endeavour/vue-library/enums";
 import { type QueryRequest } from "@endeavour/vue-library/models";
 
-import { and, asc, count, eq, inArray, isNull, or } from "drizzle-orm";
+import { and, asc, count, desc, eq, gt, gte, inArray, isNull, lt, ne, or, sql } from "drizzle-orm";
 import { type MySqlTableWithColumns } from "drizzle-orm/mysql-core";
 
 import { mysqlDb } from "../db/mysql";
@@ -45,9 +45,10 @@ export async function createJobEntry(jobRequest: JobRequest, accessToken: string
   const queryJob = {
     jobName: jobRequest.jobName || (firstQueryName ? `Job ${firstQueryName}` : "Unnamed Job"),
     queryRequests: orderedQueryRequests,
-    startOfDaySnapshot: jobRequest.startOfDaySnapshot ? 1 : 0,
+    // The daily cache flags are stored in the start_of_day_snapshot columns
+    startOfDaySnapshot: jobRequest.saveAsDailyCache ? 1 : 0,
     persistent: jobRequest.persistent ? 1 : 0,
-    useStartOfDaySnapshot: jobRequest.useStartOfDaySnapshot ? 1 : 0,
+    useStartOfDaySnapshot: jobRequest.useDailyCache ? 1 : 0,
     userId: userId,
     queueDate: now,
     status: JobStatus.QUEUED,
@@ -103,7 +104,7 @@ export async function getJobsForUser(jobIds: number[], userId: string): Promise<
 /** Rows removed per statement when clearing result tables, so a large cohort never holds one long lock. */
 export const DELETE_BATCH_SIZE = 10000;
 
-async function deleteResultRowsInBatches(table: typeof cohortResultsTable | typeof datasetResultsTable, queryResultIds: number[]) {
+export async function deleteResultRowsInBatches(table: typeof cohortResultsTable | typeof datasetResultsTable, queryResultIds: number[]) {
   while (true) {
     const [header] = await mysqlDb.delete(table).where(inArray(table.queryResultId, queryResultIds)).limit(DELETE_BATCH_SIZE);
     if (header.affectedRows < DELETE_BATCH_SIZE) return;
@@ -314,9 +315,10 @@ export async function recordJobError(jobId: number, error: unknown) {
 
 export async function createResultSetEntry(queryRequest: any, job: Job): Promise<QueryResultSet> {
   const queryResultSet = {
-    startOfDaySnapshot: queryRequest.startOfDaySnapshot ? 1 : 0,
+    // The daily cache flags are the job's, and every result created in this set copies them
+    startOfDaySnapshot: job.startOfDaySnapshot ? 1 : 0,
     persistent: queryRequest.persistent ? 1 : 0,
-    useStartOfDaySnapshot: queryRequest.useStartOfDaySnapshot ? 1 : 0,
+    useStartOfDaySnapshot: job.useStartOfDaySnapshot ? 1 : 0,
     userId: job.userId, // probably not needed
     startTime: getNow(),
     jobId: job.id,
@@ -378,7 +380,8 @@ export async function createQueryResultEntry(queryRequest: QueryRequest, queryRe
     case IMQType.COHORT:
     case IMQType.DATASET:
       const queryResult = {
-        startOfDaySnapshot: queryResultSet.startOfDaySnapshot,
+        // A debug-patient result is never offered as daily cache
+        startOfDaySnapshot: isDebugRequest(queryRequest) ? 0 : queryResultSet.startOfDaySnapshot,
         persistent: queryResultSet.persistent,
         useStartOfDaySnapshot: queryResultSet.useStartOfDaySnapshot,
         queryIri: queryRequest.query.iri,
@@ -506,6 +509,163 @@ export async function updateWithSQL(id: number, table: MySqlTableWithColumns<any
       executedSQL: sql
     })
     .where(eq(table.id, id));
+}
+
+function isDebugRequest(queryRequest: QueryRequest): boolean {
+  return !!queryRequest.argument?.some(arg => arg.parameter === "$debugPatientId");
+}
+
+/** What the daily cache needs to know about a result to copy it */
+export interface CacheSourceResult {
+  id: number;
+  queryIri: string;
+  version: number;
+  queryType: IMQType;
+  executedSQL: string | null;
+  cachedFromQueryResultId: number | null;
+}
+
+const cacheSourceColumns = {
+  id: queryResultTable.id,
+  queryIri: queryResultTable.queryIri,
+  version: queryResultTable.version,
+  queryType: queryResultTable.queryType,
+  executedSQL: queryResultTable.executedSQL,
+  cachedFromQueryResultId: queryResultTable.cachedFromQueryResultId
+};
+
+/** Start of the UTC day `today` (YYYY-MM-DD) and of the day after, matching `getToday()` */
+export function getDayBounds(today: string): { start: Date; end: Date } {
+  const start = new Date(`${today}T00:00:00.000Z`);
+  return { start, end: new Date(start.getTime() + 24 * 60 * 60 * 1000) };
+}
+
+/**
+ * The most recent result offered as daily cache for this query and arguments that completed on `today`, from any user's job other than
+ * `currentJobId` (results within a job are already shared through `getQueryResultIfExistsInJob`). See docs/DAILY_CACHE.MD §5.3.
+ */
+export async function findDailyCacheResult(iri: string, version: number, today: string, currentJobId: number): Promise<CacheSourceResult | undefined> {
+  const { start, end } = getDayBounds(today);
+  const rows = await mysqlDb
+    .select(cacheSourceColumns)
+    .from(queryResultTable)
+    .innerJoin(queryResultSetTable, eq(queryResultTable.queryResultSetId, queryResultSetTable.id))
+    .where(
+      and(
+        eq(queryResultTable.queryIri, iri),
+        eq(queryResultTable.version, version),
+        eq(queryResultTable.startOfDaySnapshot, 1),
+        eq(queryResultTable.status, JobStatus.COMPLETED),
+        gte(queryResultTable.endTime, start),
+        lt(queryResultTable.endTime, end),
+        ne(queryResultSetTable.jobId, currentJobId)
+      )
+    )
+    .orderBy(desc(queryResultTable.endTime))
+    .limit(1);
+  return rows[0] as CacheSourceResult | undefined;
+}
+
+export async function getCacheSourceResults(ids: number[]): Promise<CacheSourceResult[]> {
+  if (!ids.length) return [];
+  return (await mysqlDb.select(cacheSourceColumns).from(queryResultTable).where(inArray(queryResultTable.id, ids))) as CacheSourceResult[];
+}
+
+/** The query_dependency edges whose parent is one of `parentIds` */
+export async function getQueryDependencies(parentIds: number[]): Promise<{ parentQueryResultId: number; subQueryResultId: number }[]> {
+  if (!parentIds.length) return [];
+  return mysqlDb
+    .select({ parentQueryResultId: queryDependencyTable.parentQueryResultId, subQueryResultId: queryDependencyTable.subQueryResultId })
+    .from(queryDependencyTable)
+    .where(inArray(queryDependencyTable.parentQueryResultId, parentIds));
+}
+
+function resultTableFor(queryType: IMQType) {
+  if (queryType === IMQType.COHORT) return { table: cohortResultsTable, name: "dataset.cohort_results", columns: "entity_id, entity_org_id" };
+  if (queryType === IMQType.DATASET)
+    return { table: datasetResultsTable, name: "dataset.dataset_results", columns: "entity_id, column_group, json, entity_org_id" };
+  throw new Error("Unsupported query type for the daily cache: " + queryType);
+}
+
+/**
+ * Copies the result rows of `sourceId` to `targetId`, server side, about `DELETE_BATCH_SIZE` rows per statement so none holds a long lock.
+ * Batches are ranges of entity_id (idx_qr_entity), so an entity with several rows is always copied whole. Returns the rows copied.
+ */
+export async function copyResultRows(sourceId: number, targetId: number, queryType: IMQType): Promise<number> {
+  const { table, name, columns } = resultTableFor(queryType);
+  let copied = 0;
+  let lower: number | undefined;
+  while (true) {
+    const after = lower === undefined ? undefined : gt(table.entityId, lower);
+    // The last entity id of this batch, or none when what is left fits in one
+    const boundary = await mysqlDb
+      .select({ entityId: table.entityId })
+      .from(table)
+      .where(and(eq(table.queryResultId, sourceId), after))
+      .orderBy(asc(table.entityId))
+      .limit(1)
+      .offset(DELETE_BATCH_SIZE - 1);
+    const upper = boundary[0]?.entityId;
+    const conditions = [sql`query_result_id = ${sourceId}`];
+    if (lower !== undefined) conditions.push(sql`entity_id > ${lower}`);
+    if (upper !== undefined) conditions.push(sql`entity_id <= ${upper}`);
+    const [header]: any = await mysqlDb.execute(
+      sql`INSERT INTO ${sql.raw(name)} (query_result_id, ${sql.raw(columns)}) SELECT ${targetId}, ${sql.raw(columns)} FROM ${sql.raw(name)} WHERE ${sql.join(conditions, sql` AND `)}`
+    );
+    copied += header?.affectedRows ?? 0;
+    if (upper === undefined) return copied;
+    lower = upper;
+  }
+}
+
+/** Creates a completed-on-copy result in `queryResultSet` for a sub result found in a cached result's tree. Starts as RUNNING. */
+export async function createCopiedQueryResultEntry(source: CacheSourceResult, queryResultSet: QueryResultSet): Promise<number> {
+  const now = getNow();
+  const result = await mysqlDb.insert(queryResultTable).values({
+    startOfDaySnapshot: queryResultSet.startOfDaySnapshot,
+    persistent: queryResultSet.persistent,
+    useStartOfDaySnapshot: queryResultSet.useStartOfDaySnapshot,
+    queryIri: source.queryIri,
+    searchDate: queryResultSet.searchDate ? new Date(queryResultSet.searchDate) : null,
+    achievementDate: queryResultSet.achievementDate ? new Date(queryResultSet.achievementDate) : null,
+    queryResultSetId: queryResultSet.id,
+    version: source.version,
+    queryType: source.queryType,
+    status: JobStatus.RUNNING,
+    startTime: now
+  });
+  const id = result?.[0]?.insertId;
+  if (!id) throw new Error("Failed to insert copied query result");
+  return id;
+}
+
+/** Completes a result copied from the daily cache: its SQL is the source's, and it points at the original result */
+export async function markQueryResultCopied(id: number, source: CacheSourceResult, queryResultSet: QueryResultSet) {
+  await mysqlDb
+    .update(queryResultTable)
+    .set({
+      status: JobStatus.COMPLETED,
+      endTime: getNow(),
+      executedSQL: source.executedSQL,
+      cachedFromQueryResultId: source.cachedFromQueryResultId ?? source.id
+    })
+    .where(eq(queryResultTable.id, id));
+  emitQueueUpdate(queryResultSet.userId, { jobId: queryResultSet.jobId });
+}
+
+/**
+ * Undoes a copy that failed part way: removes its rows, and then the result itself if the copy created it, or puts it back to `status`
+ * (QUEUED for a result still to run, RUNNING for one its caller goes on to compute).
+ */
+export async function discardCopiedQueryResult(id: number, queryType: IMQType, created: boolean, status: JobStatus.QUEUED | JobStatus.RUNNING) {
+  const { table } = resultTableFor(queryType);
+  await deleteResultRowsInBatches(table, [id]);
+  if (created) await mysqlDb.delete(queryResultTable).where(eq(queryResultTable.id, id));
+  else
+    await mysqlDb
+      .update(queryResultTable)
+      .set({ status, executedSQL: null, cachedFromQueryResultId: null, endTime: null, ...(status === JobStatus.QUEUED ? { startTime: null } : {}) })
+      .where(eq(queryResultTable.id, id));
 }
 
 export function getToday() {

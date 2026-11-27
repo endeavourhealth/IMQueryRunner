@@ -78,7 +78,15 @@
                   :severity="node.data.job.status ? getStatusSeverity(node.data.job.status) : '-'"
                   :value="node.data.job.status"
                 />
-                <Tag v-else :severity="getStatusSeverity(node.data.summary.status)" :value="node.data.summary.status" />
+                <span v-else class="inline-flex items-center gap-1">
+                  <Tag :severity="getStatusSeverity(node.data.summary.status)" :value="node.data.summary.status" />
+                  <Tag
+                    v-if="node.data.summary.fromDailyCache"
+                    v-tooltip.bottom="'Copied from a result computed earlier today'"
+                    severity="secondary"
+                    value="CACHED"
+                  />
+                </span>
               </template>
             </Column>
             <Column :pt="{ columnHeaderContent: { class: 'justify-end' } }">

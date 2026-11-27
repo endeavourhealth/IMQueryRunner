@@ -217,6 +217,7 @@ export async function getJobsResultSummaries(accessToken: string, userId: string
             const subQueryResultIds = subQueryResultIdsById.get(row.id);
             if (subQueryResultIds) summary.subQueryResultIds = subQueryResultIds;
             if (row.indicatorResultId !== null) summary.indicatorResultId = row.indicatorResultId;
+            summary.fromDailyCache = row.cachedFromQueryResultId != null;
             summaries.push(summary);
           });
         }
