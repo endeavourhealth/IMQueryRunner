@@ -77,7 +77,7 @@ so a caller can opt out:
 - With both flags at their defaults, a job reuses whatever sub query results are already cached, and every result it ends up
   with, computed or reused, is saved as cache.
 - The API uses camelCase like the existing fields. The database columns are `save_as_daily_cache` and `use_daily_cache`.
-- This changes behaviour for existing callers: their jobs start saving cache and reusing cached sub query results. See §10, Q1.
+- This changes behaviour for existing callers: their jobs start saving cache and reusing cached sub query results.
 - The old request fields `startOfDaySnapshot` / `useStartOfDaySnapshot` are no longer read. A client that still sends them is not
   rejected (unknown fields are stripped) and gets the defaults.
 
@@ -173,14 +173,13 @@ arguments. Without it, a result for `$searchDate = 2025-04-01` could be reused f
 or a result filtered to one set of organisations could be reused for another. Because the cache is shared between users, this
 also stops one user's organisation-filtered result being served to a user who asked for different organisations. The
 defaults (`$searchDate` / `$achievementDate` = today) are filled in by `resolveArgs` before hashing, so a default run still
-matches any other default run of the same query that day. See §10, Q3.
+matches any other default run of the same query that day.
 
 ### 5.5 "Today"
 
 `today` is `getToday()`, which is the **UTC** date (`new Date().toISOString().slice(0, 10)`). That matches how default
 `$searchDate` values are produced. Between 00:00 and 01:00 BST, the UTC date is still the previous day, so the cache would be
-treated as yesterday's. If the business day should follow UK local time, both `getToday()` and this lookup need to use
-`Europe/London` (see §10, Q4). The date compared is the date the **result completed** (`end_time`), not the date the job was
+treated as yesterday's. The date compared is the date the **result completed** (`end_time`), not the date the job was
 queued. drizzle writes every `datetime` column as a UTC string, so `end_time` is stored in UTC and the comparison is consistent.
 
 ### 5.6 Reusing a hit
@@ -308,16 +307,8 @@ does not wait for A, which keeps the consumer simple and avoids deadlocks. This 
 
 ## 10. Open questions
 
-1. **Default on for existing callers.** Turning the cache on by default changes what existing API clients get: sub query
-   results can come from a run earlier the same day. Is that acceptable for every caller, or should some (e.g. scheduled
-   reports) send `useDailyCache: false`?
-2. **Old field names.** Implemented as dropped (§3.1). If any API client sends `startOfDaySnapshot` / `useStartOfDaySnapshot`
-   and needs them honoured, add them back as deprecated aliases.
-3. **Matching key.** Is matching on the IRI plus the argument hash (§5.4) acceptable? Ignoring arguments would be unsafe for
-   non-default dates and organisation filters, and more so now that the cache is shared between users.
-4. **Day boundary.** UTC (current `getToday()`) or `Europe/London`?
-5. **Data access between users.** Does any user have narrower data access than another, enforced other than through the query
+1. **Data access between users.** Does any user have narrower data access than another, enforced other than through the query
    arguments? If so, a shared cache could expose results computed under someone else's access, and the lookup would need to
    match on that access scope too.
-6. **Cleanup.** Every job now produces cache rows. Should a scheduled task (`server/tasks/`) clear earlier days' cache flags or
+2. **Cleanup.** Every job now produces cache rows. Should a scheduled task (`server/tasks/`) clear earlier days' cache flags or
    jobs, or are they ordinary jobs that the user manages?
